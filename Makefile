@@ -29,13 +29,13 @@ PROGRAM                = libwrapper.so
 #CC                    = $(CXX)
 
 # The extra pre-processor and compiler options; applies to both C and C++ compiling as well as LD. 
-EXTRA_CFLAGS           = -lcapstone -fPIC -static-pie -fdata-sections -ffunction-sections
+EXTRA_CFLAGS           = -fPIC -static-pie -lcapstone -fdata-sections -ffunction-sections
 
 # The extra linker options, e.g. "-lmysqlclient -lz"
 EXTRA_LDFLAGS          = 
 
 # Specify the include dirs, e.g. "-I/usr/include/mysql -I./include -I/usr/include -I/usr/local/include".
-INCLUDE                = 
+INCLUDE                = -Iinclude
 
 # The C Preprocessor options (notice here "CPP" does not mean "C++"; man cpp for more info.). Actually $(INCLUDE) is included. 
 CPPFLAGS               = -Wall -Wextra    # helpful for writing better code (behavior-related)

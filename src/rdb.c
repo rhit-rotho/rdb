@@ -1,30 +1,12 @@
 #define _GNU_SOURCE
-#include <capstone/capstone.h>
-#include <err.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <inttypes.h>
-#include <linux/limits.h>
-#include <linux/userfaultfd.h>
-#include <poll.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/auxv.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/prctl.h>
 #include <sys/ptrace.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
-#define PROCMAPS_LINE_MAX_LENGTH (PATH_MAX + 100)
 
 #define xperror(msg)                                                           \
   do {                                                                         \
@@ -32,26 +14,47 @@
     exit(EXIT_FAILURE);                                                        \
   } while (0)
 
+#define xptrace(req, pid, addr, data)                                          \
+  do {                                                                         \
+    if (ptrace(req, pid, addr, data) == -1) {                                  \
+      xperror(#req);                                                           \
+    }                                                                          \
+  } while (0)
+
 int main(int argc, char **argv) {
-  if (argc < 2)
-    printf("./rdb [pid]");
+  if (argc < 2) {
+    printf("./rdb [pid]\n");
+    return EXIT_FAILURE;
+  }
+
+  setbuf(stdout, NULL);
+  setbuf(stderr, NULL);
 
   int pid = atoll(argv[1]);
   printf("Attaching to %d...", pid);
-  if (ptrace(PTRACE_ATTACH, pid) == -1)
-    xperror("ptrace");
+  xptrace(PTRACE_ATTACH, pid, NULL, NULL);
 
-  //   if (ptrace(getppid(), PTRACE_ATTACH))
-  //     perror("ptrace");
-  //   if (ptrace(getppid(), PTRACE_DETACH))
-  //     perror("ptrace");
+  int status;
+  waitpid(pid, &status, 0);
+
+  printf("Status: %d\n", status);
+
+  struct user_regs_struct regs;
 
   time_t t;
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < 1; ++i) {
+    xptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
+    waitpid(pid, &status, 0);
+    xptrace(PTRACE_GETREGS, pid, &regs, NULL);
+    printf("%llx\n", regs.rax);
     sleep(1);
     time(&t);
+    xptrace(PTRACE_CONT, pid, NULL, NULL);
   }
 
-  if (ptrace(PTRACE_DETACH, pid) == -1)
-    xperror("ptrace");
+  xptrace(PTRACE_DETACH, pid, NULL, NULL);
+  waitpid(pid, &status, 0);
+
+  printf("Detached!");
+  return 0;
 }

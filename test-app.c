@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
   uint8_t *S = malloc(sizeof(uint8_t) * ARR_SIZE);
   uint8_t key[] = "hello,    world!";
 
-  for (;;) {
+  for (int x = 0;; x++) {
     for (int i = 0; i < ARR_SIZE; ++i)
       S[i] = i & 0xff;
 
@@ -21,6 +21,8 @@ int main(int argc, char **argv) {
       S[j] ^= i;
       S[j] ^= j;
     }
+    if (x % 0x40000 == 0)
+      printf("[%d (ppid:%d)] Finished round %d\n", gettid(), getppid(), x);
   }
 
   // for (int i = 0; i < ARR_SIZE; ++i) {

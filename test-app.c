@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +23,8 @@ int main(int argc, char **argv) {
       S[j] ^= j;
     }
     if (x % 0x40000 == 0)
-      printf("[%d (ppid:%d)] Finished round %d\n", gettid(), getppid(), x);
+      printf("[app: pid:%d tid:%d ppid:%d] Finished round %d\n", getpid(),
+             gettid(), getppid(), x);
   }
 
   // for (int i = 0; i < ARR_SIZE; ++i) {

@@ -38,7 +38,8 @@ typedef struct gdbstub_args {
 
 void sighandler(int signo) {
   UNUSED(signo);
-  printf("[%d] I got the signal!\n", gettid());
+  printf("[gdb: pid:%d tid:%d ppid:%d] I got the signal!\n", getpid(), gettid(),
+         getppid());
   exit(-1);
 }
 
@@ -50,7 +51,8 @@ void gdbstub(void) {
   // printf("Inside the binary!\n");
 
   for (;;) {
-    printf("[gdbstub %d (ppid:%d)]\n", gettid(), getppid());
+    printf("[gdb: pid:%d tid:%d ppid:%d] Alive!\n", getpid(), gettid(),
+           getppid());
     sleep(1);
   }
 
@@ -76,6 +78,9 @@ __attribute__((constructor)) static void wrapper_init(void) {
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 
+  // This is a bit of fun dancing around. Essentially, we want our ptrace thread
+  // to be pid == tid, which means swapping the context of our cloned thread to
+  // our parent after we clone.
   gdbstub_stk.ss_sp = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
   gdbstub_stk.ss_size = STACK_SIZE;
@@ -98,11 +103,10 @@ __attribute__((constructor)) static void wrapper_init(void) {
   if (munmap(tmp_stk, STACK_SIZE) == -1)
     xperror("munmap");
 
-  printf("[%d] %d\n", gettid(), __LINE__);
-
   sigset_t mask;
   sigprocmask(SIG_BLOCK, &mask, NULL);
-  printf("Blocking all signals\n");
+  printf("[gdb: pid:%d tid:%d ppid:%d] Blocking all signals\n", getpid(),
+         gettid(), getppid());
   sigfillset(&mask);
   sigprocmask(SIG_BLOCK, NULL, &mask);
 }

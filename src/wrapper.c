@@ -1,18 +1,23 @@
 #define _GNU_SOURCE
+#include <fcntl.h>
+#include <limits.h>
 #include <linux/sched.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
-#include <ucontext.h>
+#include <sys/user.h>
+#include <sys/wait.h>
 #include <unistd.h>
-
-#include <strings.h>
 
 #include "pbvt.h"
 
 #define STACK_SIZE (8 * 1024 * 1024)
+#define PROCMAPS_LINE_MAX_LENGTH (PATH_MAX + 100)
 #define UNUSED(x) (void)(x)
 
 #define xperror(x)                                                             \
@@ -32,10 +37,6 @@ long clone3(struct clone_args *cl_args, size_t size) {
   return syscall(SYS_clone3, cl_args, size);
 }
 
-typedef struct gdbstub_args {
-  ucontext_t *ucp;
-} gdbstub_args;
-
 void sighandler(int signo) {
   UNUSED(signo);
   printf("[gdb: pid:%d tid:%d ppid:%d] I got the signal!\n", getpid(), gettid(),
@@ -43,72 +44,132 @@ void sighandler(int signo) {
   exit(-1);
 }
 
-void gdbstub(void) {
-  // UNUSED(args);
-
-  signal(SIGINT, sighandler);
-
-  // printf("Inside the binary!\n");
-
-  for (;;) {
-    printf("[gdb: pid:%d tid:%d ppid:%d] Alive!\n", getpid(), gettid(),
-           getppid());
-    sleep(1);
+int read_line(int fd, char *buf, size_t n) {
+  size_t nbytes = 0;
+  while (nbytes < n && read(fd, buf, 1)) {
+    if (buf[0] == '\n') {
+      *buf = '\0';
+      return 1;
+    }
+    buf++;
+    nbytes++;
   }
-
-  return;
-}
-
-stack_t gdbstub_stk;
-ucontext_t uctx_main, uctx_gdbstub;
-
-int tmpfunc(void *args) {
-  UNUSED(args);
-  // FIXME: Race, should just wait for parent to signal that uctx_main is
-  // initialized correctly.
-  sleep(1);
-  setcontext(&uctx_main);
   return 0;
 }
 
-__attribute__((constructor)) static void wrapper_init(void) {
-  // pbvt_init();
-  // pbvt_branch_commit("main");
+void *gdbstub_stk;
+pid_t ppid;
+
+int gdbstub(void *args) {
+  UNUSED(args);
+
+  int status;
+
+  // Immediately sezie and interrupt process, this is so we can easily interrupt
+  // the process later.
+  xptrace(PTRACE_SEIZE, ppid, NULL, NULL);
+  xptrace(PTRACE_INTERRUPT, ppid, NULL, NULL);
+
+  waitpid(ppid, &status, 0);
 
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 
-  // This is a bit of fun dancing around. Essentially, we want our ptrace thread
-  // to be pid == tid, which means swapping the context of our cloned thread to
-  // our parent after we clone.
-  gdbstub_stk.ss_sp = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
-                           MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-  gdbstub_stk.ss_size = STACK_SIZE;
+  pbvt_init();
 
-  if (gdbstub_stk.ss_sp == MAP_FAILED)
-    xperror("mmap");
+  char path[PATH_MAX];
+  snprintf(path, PATH_MAX, "/proc/%d/maps", ppid);
+  int maps = open(path, O_RDONLY);
+  if (maps < 0)
+    xperror("fopen");
 
-  getcontext(&uctx_gdbstub);
-  getcontext(&uctx_main);
-  uctx_gdbstub.uc_stack = gdbstub_stk;
-  uctx_gdbstub.uc_link = NULL;
-  makecontext(&uctx_gdbstub, gdbstub, 0);
+  char buf[PROCMAPS_LINE_MAX_LENGTH];
+  while (read_line(maps, buf, PROCMAPS_LINE_MAX_LENGTH)) {
+    // printf("%s\n", buf);
+    char flags[5] = {0};
+    char name[PATH_MAX] = {0};
+    uint64_t from, to, inode;
+    uint32_t major, minor, offset;
+    sscanf(buf, "%lx-%lx %4c %x %x:%x %ld %[^\n]", &from, &to, flags, &offset,
+           &major, &minor, &inode, name);
 
-  void *tmp_stk = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
-                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-  clone(tmpfunc, tmp_stk + STACK_SIZE, CLONE_THREAD | CLONE_SIGHAND | CLONE_VM,
-        NULL);
-  swapcontext(&uctx_main, &uctx_gdbstub);
+    // bool is_r = flags[0] == 'r';
+    bool is_w = flags[1] == 'w';
+    // bool is_x = flags[2] == 'x';
 
-  if (munmap(tmp_stk, STACK_SIZE) == -1)
-    xperror("munmap");
+    if (!is_w)
+      continue;
 
-  sigset_t mask;
-  sigprocmask(SIG_BLOCK, &mask, NULL);
-  printf("[gdb: pid:%d tid:%d ppid:%d] Blocking all signals\n", getpid(),
-         gettid(), getppid());
-  sigfillset(&mask);
-  sigprocmask(SIG_BLOCK, NULL, &mask);
+    if (strstr(name, "libwrapper.so") != NULL)
+      continue;
+    if (strstr(name, "libpbvt.so") != NULL)
+      continue;
+
+    if (strcmp(name, "[heap]") == 0) {
+      printf("[stack] %s %lx-%lx %s\n", flags, from, to, name);
+      pbvt_track_range((void *)from, to - from);
+      continue;
+    }
+
+    if (strcmp(name, "[stack]") == 0) {
+      printf("[stack] %s %lx-%lx %s\n", flags, from, to, name);
+      pbvt_track_range((void *)from, to - from);
+      continue;
+    }
+
+    // if (strstr(name, "test-app") != NULL) {
+    //   printf("[test-app] %s %lx-%lx %s\n", flags, from, to, name);
+    //   pbvt_track_range((void *)from, to - from);
+    //   continue;
+    // }
+
+    printf("[ignore] %s %lx-%lx %s\n", flags, from, to, name);
+  }
+  close(maps);
+
+  pbvt_commit();
+  pbvt_branch_commit("main");
+  sleep(1);
+  xptrace(PTRACE_CONT, ppid, NULL, NULL);
+
+  struct user_regs_struct *regs =
+      pbvt_calloc(1, sizeof(struct user_regs_struct));
+  struct user_fpregs_struct *fpregs =
+      pbvt_calloc(1, sizeof(struct user_fpregs_struct));
+
+  for (int i = 0;; ++i) {
+    usleep(1000);
+    xptrace(PTRACE_INTERRUPT, ppid, NULL, NULL);
+    waitpid(ppid, &status, 0);
+
+    // Cause page fault on our regs, since ptrace will not correctly trigger our
+    // uffd_monitor.
+    regs->rax = 0;
+    fpregs->cwd = 0;
+    xptrace(PTRACE_GETREGS, ppid, NULL, regs);
+    xptrace(PTRACE_GETFPREGS, ppid, NULL, fpregs);
+
+    Commit *c = pbvt_commit();
+    if (i % 40 == 0) {
+      printf("[gdb: pid:%d tid:%d ppid:%d] Alive!\n", getpid(), gettid(),
+             getppid());
+      printf("[gdb] State: %.16lx\n", c->hash);
+      pbvt_stats();
+    }
+    xptrace(PTRACE_CONT, ppid, NULL, NULL);
+  }
+
+  return 0;
+}
+
+__attribute__((constructor)) static void wrapper_init(void) {
+  gdbstub_stk = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  ppid = getpid();
+  clone(gdbstub, gdbstub_stk + STACK_SIZE, CLONE_VM, NULL);
+  // clone(gdbstub, gdbstub_stk + STACK_SIZE,
+  //       CLONE_VM | CLONE_FILES | CLONE_FS | CLONE_PARENT | CLONE_SIGHAND,
+  //       NULL);
 }
 
 __attribute__((destructor)) static void wrapper_fini(void) {

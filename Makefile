@@ -30,7 +30,7 @@ PROGRAM                = libwrapper.so
 #CC                    = $(CXX)
 
 # The extra pre-processor and compiler options; applies to both C and C++ compiling as well as LD. 
-EXTRA_CFLAGS           = -fPIC -static-pie -fdata-sections -ffunction-sections -g2 -gdwarf-3
+EXTRA_CFLAGS           = -fPIC -static-pie -fdata-sections -ffunction-sections -fno-builtin -nostdlib -g2 -gdwarf-3
 
 # The extra linker options, e.g. "-lmysqlclient -lz"
 EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt
@@ -52,7 +52,7 @@ SRCDIRS               := src
 EXTRA_CFLAGS_MACOS     = 
 EXTRA_LDFLAGS_MACOS    = -Wl,-search_paths_first -Wl,-dead_strip -v   # deleting unused code for Pear, for minimal exe size
 LDFLAGS_MACOS          =
-EXTRA_CFLAGS_LINUX     =
+EXTRA_CFLAGS_LINUX     = -Wl,--gc-sections
 EXTRA_LDFLAGS_LINUX    = -Wl,--gc-sections -Wl,--strip-all            # deleting unused code for Pear, for minimal exe size
 LDFLAGS_LINUX          =
 EXTRA_CFLAGS_WINDOWS   =
@@ -90,8 +90,8 @@ HDREXTS = .h .H .hh .hpp .HPP .h++ .hxx .hp
 
 # The pre-processor and compiler options.
 # Users can override those variables from the command line.
-CFLAGS  = -O3
-CXXFLAGS= -O3
+CFLAGS  = -O1 #-O2
+CXXFLAGS= -O1 #-O2
 
 # The command used to delete file.
 RM     = rm -f

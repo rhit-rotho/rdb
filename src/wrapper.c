@@ -227,6 +227,8 @@ int gdbstub(void *args) {
   }
 
   for (int i = 0;; ++i) {
+    usleep(100);
+
     xptrace(PTRACE_INTERRUPT, ppid, NULL, NULL);
     waitpid(ppid, &status, 0);
 
@@ -238,12 +240,12 @@ int gdbstub(void *args) {
     xptrace(PTRACE_GETFPREGS, ppid, NULL, fpregs);
 
     Commit *c = pbvt_commit();
-    if (i % 10 == 0) {
-      printf("[gdb: pid:%d tid:%d ppid:%d] Alive!\n", getpid(), gettid(),
-             getppid());
-      printf("[gdb] State: %.16lx\n", c->hash);
-      pbvt_stats();
+    if (i % 1000 == 0) {
+      printf("[gdb: pid: %d] State: %.16lx\n", getpid(), c->current->hash);
+      // pbvt_stats();
     }
+    if (pbvt_size() > 999)
+      pbvt_gc_n(800);
     xptrace(PTRACE_CONT, ppid, NULL, NULL);
   }
 
@@ -258,6 +260,6 @@ __attribute__((constructor)) static void wrapper_init(void) {
 }
 
 __attribute__((destructor)) static void wrapper_fini(void) {
-  // if (munmap(gdbstub_stk.ss_sp, STACK_SIZE) == -1)
-  //   xperror("munmap");
+  if (munmap(gdbstub_stk, STACK_SIZE) == -1)
+    xperror("munmap");
 }

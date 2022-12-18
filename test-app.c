@@ -33,7 +33,6 @@ int main(int argc, char **argv) {
       S[j] ^= j;
     }
     if (x % 0x40000 == 0)
-      printf("[app: pid:%d tid:%d ppid:%d] Finished round %d\n", getpid(),
-             gettid(), getppid(), x);
+      printf("[app: pid:%d] Finished round %d\n", getpid(), x);
   }
 }

@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/elf.h>
 #include <linux/sched.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -11,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -18,6 +21,7 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "pbvt.h"
@@ -38,6 +42,15 @@
       xperror(#req);                                                           \
     }                                                                          \
   } while (0)
+
+#ifndef __cpuid_count
+#define __cpuid_count(level, count, a, b, c, d)                                \
+  __asm__ __volatile__("cpuid\n\t"                                             \
+                       : "=a"(a), "=b"(b), "=c"(c), "=d"(d)                    \
+                       : "0"(level), "2"(count))
+#endif
+
+static char *chars = "0123456789abcdef";
 
 long clone3(struct clone_args *cl_args, size_t size) {
   return syscall(SYS_clone3, cl_args, size);
@@ -63,6 +76,249 @@ int read_line(int fd, char *buf, size_t n) {
   return 0;
 }
 
+int starts_with(char *str, char *prefix) {
+  return strncmp(prefix, str, strlen(prefix)) == 0;
+}
+
+typedef struct gdbctx {
+  int fd;
+  pid_t ppid;
+  volatile struct user_regs_struct *regs;
+  volatile struct user_fpregs_struct *fpregs;
+  int stopped;
+} gdbctx;
+
+void gdb_send_packet(gdbctx *ctx, char *data);
+void gdb_send_empty(gdbctx *ctx);
+
+uint8_t gdb_checksum(char *c, size_t n) {
+  uint8_t r = 0;
+  for (size_t i = 0; i < n; ++i)
+    r += c[i];
+  return r;
+}
+
+void gdb_send_empty(gdbctx *ctx) { gdb_send_packet(ctx, ""); }
+
+char reply[0x1000];
+
+void gdb_send_packet(gdbctx *ctx, char *data) {
+  size_t reply_sz = strlen(data) + 0x20;
+  assert(reply_sz < sizeof(reply));
+  uint8_t c = gdb_checksum(data, strlen(data));
+  size_t nbytes = snprintf(reply, reply_sz, "$%s#%c%c", data,
+                           chars[(c >> 4) & 0xf], chars[(c >> 0) & 0xf]);
+  write(ctx->fd, reply, nbytes);
+}
+
+void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
+  char *endptr = buf + n;
+
+  // 66 gdb_num_core_regs
+
+  // int ack = 0;
+  if (*buf == '+') {
+    // ack = 1;
+    buf++;
+  }
+
+  if (buf == endptr)
+    return;
+
+  // if (*buf == '-') {
+  //   ack = -1;
+  //   buf++;
+  // }
+
+  write(ctx->fd, "+", 1);
+
+  if (*buf == '$') {
+    buf++;
+  } else {
+    int status;
+    printf("'%s'\n", buf);
+    // assert(0 && "Expected $");
+    if (!ctx->stopped) {
+      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      ctx->stopped = 1;
+    }
+
+    printf("termsig: %d\n", WTERMSIG(status));
+
+    ctx->regs->rax = 0;
+    ctx->fpregs->cwd = 0;
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+    xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+    gdb_send_packet(ctx, "S05"); // sigtrap x86
+
+    return;
+  }
+
+  if (starts_with(buf, "qSupported")) {
+    gdb_send_packet(ctx, "ReverseStep+;ReverseContinue+");
+  } else if (starts_with(buf, "vMustReplyEmpty")) {
+    buf += strlen("vMustReplyEmpty");
+
+    gdb_send_empty(ctx);
+  } else if (starts_with(buf, "H")) {
+    buf += strlen("H");
+
+    if (starts_with(buf, "g")) {
+      gdb_send_packet(ctx, "OK");
+    } else if (starts_with(buf, "c")) {
+      gdb_send_packet(ctx, "OK");
+    } else {
+      assert(0 && "unknown");
+    }
+  } else if (starts_with(buf, "q")) {
+    buf += strlen("q");
+
+    if (starts_with(buf, "TStatus")) {
+      gdb_send_empty(ctx);
+    } else if (starts_with(buf, "fThreadInfo")) {
+      gdb_send_empty(ctx);
+    } else if (starts_with(buf, "L")) {
+      gdb_send_empty(ctx);
+    } else if (starts_with(buf, "C")) {
+      printf("Unimplemented: current thread ID\n");
+      gdb_send_packet(ctx, "1");
+    } else if (starts_with(buf, "Attached")) {
+      gdb_send_packet(ctx, "1");
+    } else {
+      printf("Unimplemented query: '%s'\n", buf);
+      gdb_send_empty(ctx);
+    }
+  } else if (starts_with(buf, "?")) {
+    printf("[gdb] Unimplemented: stop reply ?\n");
+    gdb_send_packet(ctx, "S05");
+  } else if (starts_with(buf, "g")) {
+    printf("[gdb] Unimplemented: get registers\n");
+
+    size_t xsave_size = 560; // x86
+    // size_t xsave_size = 528; // x86
+    char xsave[560];
+    for (size_t i = 0; i < xsave_size; ++i)
+      xsave[i] = i;
+
+    int status;
+    if (!ctx->stopped) {
+      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      ctx->stopped = 1;
+    }
+
+    struct user_regs_struct regs;
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &regs);
+
+    memcpy(xsave + 0x00, &regs.rax, sizeof(regs.rax));
+    memcpy(xsave + 0x08, &regs.rbx, sizeof(regs.rbx));
+    memcpy(xsave + 0x80, &regs.rip, sizeof(regs.rip));
+
+    char data[0x561];
+
+    for (size_t i = 0; i < xsave_size; ++i) {
+      data[2 * i] = chars[(xsave[i] >> 4) & 0xf];
+      data[2 * i + 1] = chars[(xsave[i] >> 0) & 0xf];
+    }
+
+    data[xsave_size * 2] = '\0';
+    printf("[gdb] REGISTERS: %s\n", data);
+
+    gdb_send_packet(ctx, data);
+  } else if (starts_with(buf, "m")) {
+    buf += strlen("m");
+    char *addr = (char *)strtoull(buf, &endptr, 0x10);
+
+    if (addr == NULL) {
+      gdb_send_packet(ctx, "E14");
+      return;
+    }
+
+    buf = endptr;
+    assert(*buf == ',');
+    buf += 1;
+    size_t sz = strtoull(buf, &endptr, 0x10);
+
+    char data[0x200];
+    assert(sz * 2 < sizeof(data));
+
+    for (size_t i = 0; i < sz; ++i) {
+      data[2 * i] = chars[(addr[i] >> 4) & 0xf];
+      data[2 * i + 1] = chars[(addr[i] >> 0) & 0xf];
+    }
+    data[sz * 2] = '\0';
+
+    printf("[gdb] MEMORY: %p[%ld]: %s\n", addr, sz, data);
+
+    gdb_send_packet(ctx, data);
+  } else if (starts_with(buf, "bc")) {
+    printf("[gdb] reverse continue!\n");
+
+    int status;
+    if (!ctx->stopped) {
+      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      ctx->stopped = 1;
+    }
+
+    // ctx->regs->rax = 0;
+    // ctx->fpregs->cwd = 0;
+    // xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+    // xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+    printf("[gdb] Checking out to %.16lx\n",
+           pbvt_head()->parent->current->hash);
+    pbvt_checkout(pbvt_head()->parent);
+
+    printf("[gdb] SETREGS: %p\n", ctx->regs);
+
+    // HACK: We shouldn't need this
+    // xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+    // printf("Waiting for child...\n");
+    // waitpid(ctx->ppid, &status, 0);
+    // ctx->stopped = 1;
+
+    for (int i = 0; i < 0x10; ++i) {
+      ptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+      ptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+      printf("Set rip to %p\n", ctx->regs->rip);
+    }
+    gdb_send_packet(ctx, "S05"); // sigtrap x86
+  } else if (starts_with(buf, "vCont?")) {
+    gdb_send_packet(ctx, "vCont;c;s");
+  } else if (starts_with(buf, "vCont;")) {
+    printf("Assuming continue... %d\n", ctx->ppid);
+
+    ctx->regs->rax = 0;
+    ctx->fpregs->cwd = 0;
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+    xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+    xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+    ctx->stopped = 0;
+
+    // TODO: Is this correct?
+    // gdb_send_empty(ctx);
+  } else if (starts_with(buf, "c")) {
+    ctx->regs->rax = 0;
+    ctx->fpregs->cwd = 0;
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+    xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+    xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+    ctx->stopped = 0;
+  } else if (starts_with(buf, "s")) {
+    printf("single-step!");
+    int status;
+    xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+    waitpid(ctx->ppid, &status, 0);
+    ctx->stopped = 1;
+    gdb_send_packet(ctx, "S05");
+  } else {
+    gdb_send_empty(ctx);
+  }
+}
+
 void *gdbstub_stk;
 pid_t ppid;
 
@@ -71,8 +327,8 @@ int gdbstub(void *args) {
 
   int status;
 
-  // Immediately sezie and interrupt process, this is so we can easily interrupt
-  // the process later.
+  // Immediately sezie and interrupt process, this is so we can easily
+  // interrupt the process later.
   xptrace(PTRACE_SEIZE, ppid, NULL, NULL);
   xptrace(PTRACE_INTERRUPT, ppid, NULL, NULL);
 
@@ -137,13 +393,6 @@ int gdbstub(void *args) {
 
   pbvt_commit();
   pbvt_branch_commit("main");
-  sleep(1);
-  xptrace(PTRACE_CONT, ppid, NULL, NULL);
-
-  struct user_regs_struct *regs =
-      pbvt_calloc(1, sizeof(struct user_regs_struct));
-  struct user_fpregs_struct *fpregs =
-      pbvt_calloc(1, sizeof(struct user_fpregs_struct));
 
   int gdb_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (gdb_socket < 0)
@@ -168,18 +417,26 @@ int gdbstub(void *args) {
     xperror("listen");
 
   printf("Waiting for connection from gdb on 0.0.0.0:4444...");
-  // struct sockaddr_in caddr;
-  // socklen_t clen = sizeof(caddr);
   int cfd = accept(gdb_socket, NULL, NULL);
   if (cfd < 0)
     xperror("accept");
 
   printf("done.\n");
 
+  gdbctx gctx = {0};
+  gctx.fd = cfd;
+  gctx.ppid = ppid;
+  gctx.stopped = 1;
+
+  gctx.regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
+  gctx.fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
+
   int timer = timerfd_create(CLOCK_MONOTONIC, 0);
   struct itimerspec arm = {0};
-  arm.it_interval.tv_nsec = 10000 * 1000;
-  timerfd_settime(timer, 0, &arm, NULL);
+  arm.it_interval.tv_nsec = 0;
+  arm.it_interval.tv_sec = 1;
+  if (timerfd_settime(timer, 0, &arm, NULL) < 0)
+    xperror("timerfd_settime");
 
   // TODO: Add signalfd for handling segfaults, syscalls, and signals
   struct pollfd pollfds[2] = {0};
@@ -190,6 +447,11 @@ int gdbstub(void *args) {
 
   char gdb_buf[0x100];
 
+  gctx.regs->rax = 0;
+  gctx.fpregs->cwd = 0;
+  xptrace(PTRACE_GETREGS, gctx.ppid, NULL, gctx.regs);
+  xptrace(PTRACE_GETFPREGS, gctx.ppid, NULL, gctx.fpregs);
+
   for (;;) {
     if (poll(pollfds, 2, -1) < 0)
       xperror("poll(wrapper)");
@@ -198,27 +460,24 @@ int gdbstub(void *args) {
     if (pollfds[0].revents & POLLERR)
       xperror("POLLERR in timer");
     if (pollfds[0].revents & POLLIN) {
+      uint64_t expiry;
+      read(pollfds[0].fd, &expiry, sizeof(expiry));
+      printf("expiry: %d\n", expiry);
+      continue;
     }
 
     // socket
     if (pollfds[1].revents & POLLERR)
       xperror("POLLERR in socket");
     if (pollfds[1].revents & POLLIN) {
-      // TODO: Implement the rest of gdb's wire protocol
       int nbytes = read(pollfds[1].fd, gdb_buf, sizeof(gdb_buf) - 1);
       if (nbytes < 0)
         xperror("read");
+      if (nbytes == 0)
+        break;
       gdb_buf[nbytes] = '\0';
-      printf("gdb: \"%s\"\n", gdb_buf);
-      if (strncmp(gdb_buf, "$qSupported:", 12) == 0) {
-        write(pollfds[1].fd, "+$#00", 5);
-        printf("wrote out\n");
-        continue;
-      }
-      if (strncmp(gdb_buf, "+", 1) == 0) {
-        write(pollfds[1].fd, "+$#00", 5);
-        continue;
-      }
+      printf("[gdb] \"%s\"\n", gdb_buf);
+      gdb_handle_packet(&gctx, gdb_buf, nbytes);
 
       continue;
     }
@@ -232,12 +491,12 @@ int gdbstub(void *args) {
     xptrace(PTRACE_INTERRUPT, ppid, NULL, NULL);
     waitpid(ppid, &status, 0);
 
-    // Cause page fault on our regs, since ptrace will not correctly trigger our
-    // uffd_monitor.
-    regs->rax = 0;
-    fpregs->cwd = 0;
-    xptrace(PTRACE_GETREGS, ppid, NULL, regs);
-    xptrace(PTRACE_GETFPREGS, ppid, NULL, fpregs);
+    // Cause page fault on our regs, since ptrace will not correctly trigger
+    // our uffd_monitor.
+    gctx.regs->rax = 0;
+    gctx.fpregs->cwd = 0;
+    xptrace(PTRACE_GETREGS, ppid, NULL, gctx.regs);
+    xptrace(PTRACE_GETFPREGS, ppid, NULL, gctx.fpregs);
 
     Commit *c = pbvt_commit();
     if (i % 1000 == 0) {

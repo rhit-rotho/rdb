@@ -51,9 +51,11 @@ static char *chars = "0123456789abcdef";
 #define GDB_PRINTF_HEADER "\e[33m[gdb: %d]\e[0m "
 #define GDB_PRINTF_TRAILER ""
 
+#define DEBUG 1
+
 #define GDB_PRINTF(fmt, ...)                                                   \
   do {                                                                         \
-    if (1)                                                                     \
+    if (DEBUG)                                                                 \
       fprintf(stderr, GDB_PRINTF_HEADER fmt GDB_PRINTF_TRAILER, getpid(),      \
               __VA_ARGS__);                                                    \
   } while (0)
@@ -560,6 +562,8 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
       pbvt_commit();
     }
 
+    // pbvt_print_range("state.dot", 0, 0);
+
     GDB_PRINTF("Current state: %.16lx\n", pbvt_head()->current);
     GDB_PRINTF("Current parent: %.16lx\n", pbvt_head()->parent);
 
@@ -757,6 +761,7 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
     xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
     pbvt_commit();
+    // pbvt_print_range("state.dot", 0, 0);
 
     gdb_send_packet(ctx, "S05");
   } else {

@@ -11,9 +11,11 @@
 
 #define TEST_PRINTF_HEADER "\e[32m[test-app: %d]\e[0m "
 
+#define DEBUG 1
+
 #define TEST_PRINTF(fmt, ...)                                                  \
   do {                                                                         \
-    if (1)                                                                     \
+    if (DEBUG)                                                                 \
       fprintf(stderr, TEST_PRINTF_HEADER fmt, getpid(), __VA_ARGS__);          \
   } while (0)
 
@@ -26,11 +28,11 @@ int main(int argc, char **argv) {
   char S[ARR_SIZE] = {0};
 
   for (size_t counter = 0;; ++counter) {
-    size_t i;
-    for (i = 0; i < sizeof(str); ++i)
-      if ((S[i] & 0x7f) != (str[i] & 0x7f))
+    size_t idx;
+    for (idx = 0; idx < sizeof(str); ++idx)
+      if ((S[idx] & 0x7f) != (str[idx] & 0x7f))
         break;
-    if (i == sizeof(str))
+    if (idx == sizeof(str))
       break;
 
     if (counter % 0x1000000 == 0)

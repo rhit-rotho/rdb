@@ -62,6 +62,9 @@ static char *chars = "0123456789abcdef";
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+void *gdbstub_stk;
+pid_t ppid;
+
 long clone3(struct clone_args *cl_args, size_t size) {
   return syscall(SYS_clone3, cl_args, size);
 }
@@ -70,7 +73,8 @@ void sighandler(int signo) {
   UNUSED(signo);
   GDB_PRINTF("pid:%d tid:%d ppid:%d I got the signal!\n", getpid(), gettid(),
              getppid());
-  exit(-1);
+  kill(ppid, SIGINT);
+  exit(0);
 }
 
 int read_line(int fd, char *buf, size_t n) {
@@ -562,7 +566,10 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
       pbvt_commit();
     }
 
-    // pbvt_print_range("state.dot", 0, 0);
+    // pbvt_print_range("state.dot",
+    //                  (uint64_t)ctx->regs +
+    //                      offsetof(struct user_regs_struct, rax),
+    //                  4 * sizeof(uintptr_t));
 
     GDB_PRINTF("Current state: %.16lx\n", pbvt_head()->current);
     GDB_PRINTF("Current parent: %.16lx\n", pbvt_head()->parent);
@@ -761,16 +768,16 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
     xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
     pbvt_commit();
-    // pbvt_print_range("state.dot", 0, 0);
+    // pbvt_print_range("state.dot",
+    //                  (uint64_t)ctx->regs +
+    //                      offsetof(struct user_regs_struct, rax),
+    //                  4 * sizeof(uintptr_t));
 
     gdb_send_packet(ctx, "S05");
   } else {
     gdb_send_empty(ctx);
   }
 }
-
-void *gdbstub_stk;
-pid_t ppid;
 
 int gdbstub(void *args) {
   UNUSED(args);
@@ -788,6 +795,8 @@ int gdbstub(void *args) {
   setbuf(stderr, NULL);
 
   pbvt_init();
+
+  signal(SIGSEGV, sighandler);
 
   char path[PATH_MAX];
   snprintf(path, PATH_MAX, "/proc/%d/maps", ppid);

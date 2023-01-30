@@ -39,7 +39,7 @@ EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt
 INCLUDE                = -Iinclude
 
 # The C Preprocessor options (notice here "CPP" does not mean "C++"; man cpp for more info.). Actually $(INCLUDE) is included. 
-CPPFLAGS               = -Wall -Werror -Wextra    # helpful for writing better code (behavior-related)
+CPPFLAGS               = -Wall -Wextra    # helpful for writing better code (behavior-related)
 
 # The options used in linking as well as in any direct use of ld. 
 LDFLAGS                = -shared
@@ -90,8 +90,8 @@ HDREXTS = .h .H .hh .hpp .HPP .h++ .hxx .hp
 
 # The pre-processor and compiler options.
 # Users can override those variables from the command line.
-CFLAGS  = -O1 #-O2
-CXXFLAGS= -O1 #-O2
+CFLAGS  = -O2
+CXXFLAGS= -O2
 
 # The command used to delete file.
 RM     = rm -f

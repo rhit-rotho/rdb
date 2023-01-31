@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -129,11 +130,12 @@ int gdbstub(void *args) {
   pbvt_branch_commit("main");
 
   gdbctx gctx = {0};
-  // gctx.fd = cfd;
-  gctx.ppid = ppid;
-  gctx.stopped = 1;
-  gctx.regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
-  gctx.fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
+  gdbctx *ctx = &gctx;
+
+  ctx->ppid = ppid;
+  ctx->stopped = 1;
+  ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
+  ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
 
   pbvt_commit();
 
@@ -164,36 +166,48 @@ int gdbstub(void *args) {
   int cfd = accept(gdb_socket, NULL, NULL);
   if (cfd < 0)
     xperror("accept");
-  gctx.fd = cfd;
+  ctx->fd = cfd;
 
   GDB_PRINTF("done.\n", 0);
 
-  int timer = timerfd_create(CLOCK_MONOTONIC, 0);
+  int timerfd = timerfd_create(CLOCK_REALTIME, 0);
   struct itimerspec arm = {0};
-  arm.it_interval.tv_nsec = 0;
-  arm.it_interval.tv_sec = 1;
-  if (timerfd_settime(timer, 0, &arm, NULL) < 0)
+  arm.it_interval.tv_sec = 0;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 10;
+  arm.it_value.tv_sec = 0;
+  arm.it_value.tv_nsec = 1000 * 1000 * 10;
+  if (timerfd_settime(timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 
+  sigset_t mask = {0};
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGCHLD);
+  sigprocmask(SIG_BLOCK, &mask, NULL);
+  int sfd = signalfd(-1, &mask, 0);
+  if (sfd < 0)
+    xperror("signalfd");
+
   // TODO: Add signalfd for handling segfaults, syscalls, and signals
-  struct pollfd pollfds[2] = {0};
-  pollfds[0].fd = timer;
-  pollfds[1].events = POLLIN | POLLERR;
+  struct pollfd pollfds[3] = {0};
+  pollfds[0].fd = timerfd;
+  pollfds[0].events = POLLIN | POLLERR;
   pollfds[1].fd = cfd;
   pollfds[1].events = POLLIN | POLLERR;
+  pollfds[2].fd = sfd;
+  pollfds[2].events = POLLIN | POLLERR;
 
   char gdb_buf[0x100];
 
-  gctx.regs->rax = 0;
-  gctx.fpregs->cwd = 0;
-  xptrace(PTRACE_GETREGS, gctx.ppid, NULL, gctx.regs);
-  xptrace(PTRACE_GETFPREGS, gctx.ppid, NULL, gctx.fpregs);
+  ctx->regs->rax = 0;
+  ctx->fpregs->cwd = 0;
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
   pbvt_commit();
 
-  // xptrace(PTRACE_SINGLESTEP, gctx.ppid, NULL, NULL);
+  size_t snap_counter = 0;
 
   for (;;) {
-    if (poll(pollfds, 2, -1) < 0)
+    if (poll(pollfds, 3, -1) < 0)
       xperror("poll(wrapper)");
 
     // Timer
@@ -202,11 +216,31 @@ int gdbstub(void *args) {
     if (pollfds[0].revents & POLLIN) {
       uint64_t expiry;
       read(pollfds[0].fd, &expiry, sizeof(expiry));
-      GDB_PRINTF("expiry: %d\n", expiry);
+
+      if (ctx->stopped)
+        continue;
+
+      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      ctx->stopped = 1;
+
+      ctx->regs->rax = 0;
+      ctx->fpregs->cwd = 0;
+      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+      xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+      pbvt_commit();
+
+      xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+      ctx->stopped = 0;
+
+      snap_counter += 1;
+      if (snap_counter % 100 == 0)
+        pbvt_stats();
       continue;
     }
 
-    // socket
+    // Socket
     if (pollfds[1].revents & POLLERR)
       xperror("POLLERR in socket");
     if (pollfds[1].revents & POLLIN) {
@@ -217,8 +251,28 @@ int gdbstub(void *args) {
         break;
       gdb_buf[nbytes] = '\0';
       GDB_PRINTF("Remote: \"%s\"\n", gdb_buf);
-      gdb_handle_packet(&gctx, gdb_buf, nbytes);
+      gdb_handle_packet(ctx, gdb_buf, nbytes);
 
+      continue;
+    }
+
+    // Process hit syscall
+    if (pollfds[2].revents & POLLERR)
+      xperror("POLLERR in signalfd");
+    if (pollfds[2].revents & POLLIN) {
+      struct signalfd_siginfo si;
+      read(pollfds[2].fd, &si, sizeof(si));
+
+      // ctx->regs->rax = 0;
+      // ctx->fpregs->cwd = 0;
+      // xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+      // xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+      // pbvt_commit();
+      // xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+
+      // snap_counter += 1;
+      // if (snap_counter % 0x100 == 0)
+      //   pbvt_stats();
       continue;
     }
 

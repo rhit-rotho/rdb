@@ -41,11 +41,25 @@ void gdb_send_packet(gdbctx *ctx, char *data) {
 
 // TODO: Escape packet bytes
 void gdb_send_packet_bytes(gdbctx *ctx, char *data, size_t n) {
-  uint8_t c = gdb_checksum(data, n);
+  uint8_t c = 0;
   size_t t = 0;
   reply[t++] = '$';
-  for (size_t i = 0; i < n; ++i)
-    reply[t++] = data[i];
+  for (size_t i = 0; i < n; ++i) {
+    switch (data[i]) {
+    case '$':
+    case '#':
+    case '}':
+    case '*':
+      reply[t++] = '}';
+      reply[t++] = data[i] ^ 0x20;
+      c += (data[i] ^ 0x20) + '}';
+      break;
+    default:
+      reply[t++] = data[i];
+      c += data[i];
+      break;
+    }
+  }
   reply[t++] = '#';
   reply[t++] = chars[(c >> 4) & 0xf];
   reply[t++] = chars[(c >> 0) & 0xf];
@@ -68,14 +82,12 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
   } else {
     int status;
     GDB_PRINTF("'%s'\n", buf);
-    // assert(0 && "Expected $");
+
     if (!ctx->stopped) {
       xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
       waitpid(ctx->ppid, &status, 0);
       ctx->stopped = 1;
     }
-
-    GDB_PRINTF("termsig: %d\n", WTERMSIG(status));
 
     ctx->regs->rax = 0;
     ctx->fpregs->cwd = 0;
@@ -127,7 +139,7 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     //   case 'T':
     //   case 'Q':
   default:
-    printf("Unandled %s\n", buf);
+    GDB_PRINTF("Unandled %s\n", buf);
     gdb_send_packet(ctx, "OK");
     break;
   }
@@ -153,8 +165,6 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     break;
   }
   case 's': {
-    GDB_PRINTF("reverse step!\n", 0);
-
     int status;
     if (!ctx->stopped) {
       xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
@@ -193,8 +203,7 @@ void gdb_handle_d_set_commands(gdbctx *ctx, char *buf, size_t n) {
 void gdb_handle_g_commands(gdbctx *ctx, char *buf, size_t n) {
   GDB_PRINTF("PARTIAL: get registers\n", 0);
 
-  size_t xsave_size = 300; // x86-64
-  // size_t xsave_size = 528; // x86
+  size_t xsave_size = 300; // x86_64
   char xsave[xsave_size];
   for (size_t i = 0; i < xsave_size; ++i)
     xsave[i] = i;
@@ -254,6 +263,7 @@ void gdb_handle_g_commands(gdbctx *ctx, char *buf, size_t n) {
   gdb_send_packet(ctx, data);
 }
 
+// TODO: Set thread for current operations
 void gdb_handle_h_set_commands(gdbctx *ctx, char *buf, size_t n) {
   if (starts_with(buf, "g")) {
     gdb_send_packet(ctx, "OK");
@@ -475,19 +485,16 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
     buf += 1;
     uintptr_t length = strtoull(buf, &endptr, 0x10);
 
-    GDB_PRINTF("AUXV[%d, %d]\n", offset, length);
-
-    char ebuf[0x400];
+    char data[0x400];
     size_t t = 0;
-    ebuf[t++] = 'l';
+    data[t++] = 'l';
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/proc/%d/auxv", ctx->ppid);
     int afd = open(path, O_RDONLY);
-    t += pread(afd, &ebuf[t], length, offset);
+    t += pread(afd, &data[t], length, offset);
     close(afd);
 
-    // TODO: Properly escape binary afd
-    gdb_send_packet_bytes(ctx, ebuf, t);
+    gdb_send_packet_bytes(ctx, data, t);
   } else if (starts_with(buf, "Xfer:libraries-svr4:read:")) {
     gdb_send_packet(ctx, "l<library-list-svr4 version=\"1.0\"/>");
   } else if (starts_with(buf, "Xfer:features:read:target.xml:")) {
@@ -501,8 +508,9 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
 
     int tfd = open("target.xml", O_RDONLY);
 
-    char ebuf[0x4000];
-    ssize_t nbytes = pread(tfd, ebuf, MIN(count, sizeof(ebuf)), offset);
+    char data[0x4000];
+    data[0] = 'm';
+    ssize_t nbytes = pread(tfd, data + 1, MIN(count, sizeof(data) - 1), offset);
     close(tfd);
 
     if (nbytes == 0) {
@@ -512,23 +520,7 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
       snprintf(res, sizeof(res), "E%lx", nbytes);
       gdb_send_packet(ctx, res);
     } else {
-      char data[0x5000];
-      size_t t = snprintf(data, sizeof(data), "m");
-      for (ssize_t i = 0; i < nbytes; ++i) {
-        switch (ebuf[i]) {
-        case '$':
-        case '#':
-        case '}':
-        case '*':
-          data[t++] = '}';
-          data[t++] = ebuf[i] ^ 0x20;
-          break;
-        default:
-          data[t++] = ebuf[i];
-          break;
-        }
-      }
-      gdb_send_packet_bytes(ctx, data, t);
+      gdb_send_packet_bytes(ctx, data, nbytes + 1);
     }
   } else if (starts_with(buf, "Xfer:exec-file:read:")) {
     buf += strlen("Xfer:exec-file:read:");
@@ -543,9 +535,7 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
 
     GDB_PRINTF("PARTIAL read-file: %d %d\n", offset, length);
 
-    // uint8_t ebuf[0x200];
     size_t nbytes = 0;
-
     if (nbytes == 0) {
       gdb_send_packet(ctx, "l/home/omar/projects/rdb/test-app");
       return;
@@ -565,7 +555,6 @@ void gdb_handle_s_commands(gdbctx *ctx, char *buf, size_t n) {
   waitpid(ctx->ppid, &status, 0);
   ctx->stopped = 1;
 
-  GDB_PRINTF("%d\n", __LINE__);
   ctx->regs->rax = 0;
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
@@ -613,8 +602,8 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
       size_t offset = strtoull(buf, &endptr, 0x10);
       buf = endptr;
 
-      char ebuf[0x4000];
-      ssize_t nbytes = pread(fildes, ebuf, MIN(count, sizeof(ebuf)), offset);
+      char data[0x4000];
+      ssize_t nbytes = pread(fildes, data, MIN(count, sizeof(data)), offset);
       GDB_PRINTF("pread(%lx, %lx, %lx) => %lx\n", fildes, count, offset,
                  nbytes);
       if (nbytes < 0) {
@@ -624,20 +613,6 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
       } else {
         char data[0x5000];
         size_t t = snprintf(data, sizeof(data), "F%lx;", nbytes);
-        for (ssize_t i = 0; i < nbytes; ++i) {
-          switch (ebuf[i]) {
-          case '$':
-          case '#':
-          case '}':
-          case '*':
-            data[t++] = '}';
-            data[t++] = ebuf[i] ^ 0x20;
-            break;
-          default:
-            data[t++] = ebuf[i];
-            break;
-          }
-        }
         gdb_send_packet_bytes(ctx, data, t);
       }
     } else if (starts_with(buf, "fstat:")) {
@@ -645,10 +620,10 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
       // char *endptr;
       // size_t fildes = strtoull(buf, &endptr, 0x10);
 
-      char ebuf[0x40] = {0};
+      char data[0x40] = {0};
       uint64_t val = 0x030201;
-      memcpy(ebuf + 28, &val, sizeof(val));
-      size_t nbytes = sizeof(ebuf);
+      memcpy(data + 28, &val, sizeof(val));
+      size_t nbytes = sizeof(data);
       // int ret = fstat(fildes, &buf);
       int ret = 0;
       // size_t nbytes = 9999;
@@ -660,20 +635,6 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
       } else {
         char data[0x500];
         size_t t = snprintf(data, sizeof(data), "F%lx;", nbytes);
-        for (size_t i = 0; i < nbytes; ++i) {
-          switch (ebuf[i]) {
-          case '#':
-          case '$':
-          case '*':
-          case '}':
-            data[t++] = '}';
-            data[t++] = ebuf[i] ^ 0x20;
-            break;
-          default:
-            data[t++] = ebuf[i];
-            break;
-          }
-        }
         GDB_PRINTF("fstat: '%s' %d\n", data, t);
         gdb_send_packet_bytes(ctx, data, t);
       }

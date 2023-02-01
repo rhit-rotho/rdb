@@ -1,22 +1,28 @@
+#include <errno.h>
 #include <stdint.h>
 #include <unistd.h>
 
-#define GDB_PRINTF_HEADER "\e[33m[gdb: %d]\e[0m "
+#define UNUSED(x) (void)(x)
+
+#define GDB_PRINTF_HEADER "\e[33m[gdb: %d, %s:%d]\e[0m "
 #define GDB_PRINTF_TRAILER ""
 
+#ifndef DEBUG
 #define DEBUG 1
+#endif
 
 #define GDB_PRINTF(fmt, ...)                                                   \
   do {                                                                         \
     if (DEBUG)                                                                 \
       fprintf(stderr, GDB_PRINTF_HEADER fmt GDB_PRINTF_TRAILER, getpid(),      \
-              __VA_ARGS__);                                                    \
+              __FILE__, __LINE__, __VA_ARGS__);                                \
   } while (0)
 
 #define xptrace(req, pid, addr, data)                                          \
   do {                                                                         \
     if (ptrace(req, pid, addr, data) == -1) {                                  \
-      xperror(#req);                                                           \
+      GDB_PRINTF("%s: %s\n", #req, strerror(errno));                           \
+      exit(-1);                                                                \
     }                                                                          \
   } while (0)
 
@@ -35,6 +41,10 @@ typedef struct gdbctx {
 } gdbctx;
 
 uint8_t gdb_checksum(char *c, size_t n);
+
+void gdb_save_state(gdbctx *ctx);
+void gdb_pause(gdbctx *ctx);
+void gdb_continue(gdbctx *ctx);
 
 void gdb_send_empty(gdbctx *ctx);
 void gdb_send_packet(gdbctx *ctx, char *data);

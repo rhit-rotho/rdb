@@ -21,6 +21,26 @@ int starts_with(char *str, char *prefix) {
   return strncmp(prefix, str, strlen(prefix)) == 0;
 }
 
+void gdb_pause(gdbctx *ctx) {
+  int status;
+  xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+  waitpid(ctx->ppid, &status, 0);
+  ctx->stopped = 1;
+}
+
+void gdb_continue(gdbctx *ctx) {
+  xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+  ctx->stopped = 0;
+}
+
+void gdb_save_state(gdbctx *ctx) {
+  ctx->regs->rax = 0;
+  ctx->fpregs->cwd = 0;
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+  pbvt_commit();
+}
+
 uint8_t gdb_checksum(char *c, size_t n) {
   uint8_t r = 0;
   for (size_t i = 0; i < n; ++i)
@@ -68,35 +88,33 @@ void gdb_send_packet_bytes(gdbctx *ctx, char *data, size_t n) {
 
 void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
   char *endptr = buf + n;
+  if (*buf == '\x03') {
+    if (!ctx->stopped)
+      gdb_pause(ctx);
 
-  if (*buf == '+')
-    buf++;
+    gdb_save_state(ctx);
+    write(ctx->fd, "+", 1);
+    gdb_send_packet(ctx, "S05"); // sigtrap x86
+    buf += 1;
+    n -= 1;
+  }
 
   if (buf == endptr)
     return;
 
+  if (*buf == '+')
+    buf += 1;
+
+  if (buf == endptr)
+    return;
+
+  // TODO: This should be a proper ack, not just whenever we think it'll pacify
+  // GDB
   write(ctx->fd, "+", 1);
 
-  if (*buf == '$') {
+  assert(*buf == '$');
+  if (*buf == '$')
     buf++;
-  } else {
-    int status;
-    GDB_PRINTF("'%s'\n", buf);
-
-    if (!ctx->stopped) {
-      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
-      waitpid(ctx->ppid, &status, 0);
-      ctx->stopped = 1;
-    }
-
-    ctx->regs->rax = 0;
-    ctx->fpregs->cwd = 0;
-    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-    xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-    gdb_send_packet(ctx, "S05"); // sigtrap x86
-
-    return;
-  }
 
   char c = buf[0];
   buf++;
@@ -129,32 +147,30 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     return gdb_handle_s_commands(ctx, buf, n);
   case 'v':
     return gdb_handle_v_commands(ctx, buf, n);
-    //   case 'C':
-    //   case 'k':
-    //   case 'F':
-    //   case 'G':
-    //   case 'p':
-    //   case 'Z':
-    //   case 'z':
-    //   case 'T':
-    //   case 'Q':
+  case 'C':
+  case 'k':
+  case 'F':
+  case 'G':
+  case 'p':
+  case 'Z':
+  case 'z':
+  case 'T':
+  case 'Q':
   default:
     GDB_PRINTF("Unandled %s\n", buf);
-    gdb_send_packet(ctx, "OK");
+    gdb_send_empty(ctx);
     break;
   }
 }
 
 // Handle backwards commands
 void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
+  UNUSED(n);
+
   switch (buf[0]) {
   case 'c': {
-    int status;
-    if (!ctx->stopped) {
-      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
-      waitpid(ctx->ppid, &status, 0);
-      ctx->stopped = 1;
-    }
+    if (!ctx->stopped)
+      gdb_pause(ctx);
 
     GDB_PRINTF("Checking out to %.16lx\n", pbvt_head()->parent->current->hash);
     pbvt_checkout(pbvt_head()->parent);
@@ -165,13 +181,9 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     break;
   }
   case 's': {
-    int status;
     if (!ctx->stopped) {
-      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
-      waitpid(ctx->ppid, &status, 0);
-      ctx->stopped = 1;
-
-      pbvt_commit();
+      gdb_pause(ctx);
+      gdb_save_state(ctx);
     }
 
     pbvt_checkout(pbvt_commit_parent(pbvt_head()));
@@ -184,23 +196,28 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 }
 
 void gdb_handle_c_commands(gdbctx *ctx, char *buf, size_t n) {
-  ctx->regs->rax = 0;
-  ctx->fpregs->cwd = 0;
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  pbvt_commit();
+  UNUSED(buf);
+  UNUSED(n);
 
-  xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
-  ctx->stopped = 0;
+  gdb_save_state(ctx);
+  gdb_continue(ctx);
+  // gdb_send_packet(ctx, "S12"); // sigcont x86
+  gdb_send_packet(ctx, "OK");
 }
 
 void gdb_handle_d_set_commands(gdbctx *ctx, char *buf, size_t n) {
+  UNUSED(buf);
+  UNUSED(n);
+
   GDB_PRINTF("Received detach, goodbye!\n", 0);
   xptrace(PTRACE_DETACH, ctx->ppid, NULL, NULL);
   exit(-1);
 }
 
 void gdb_handle_g_commands(gdbctx *ctx, char *buf, size_t n) {
+  UNUSED(buf);
+  UNUSED(n);
+
   GDB_PRINTF("PARTIAL: get registers\n", 0);
 
   size_t xsave_size = 300; // x86_64
@@ -208,12 +225,8 @@ void gdb_handle_g_commands(gdbctx *ctx, char *buf, size_t n) {
   for (size_t i = 0; i < xsave_size; ++i)
     xsave[i] = i;
 
-  int status;
-  if (!ctx->stopped) {
-    xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
-    waitpid(ctx->ppid, &status, 0);
-    ctx->stopped = 1;
-  }
+  if (!ctx->stopped)
+    gdb_pause(ctx);
 
   struct user_regs_struct regs;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &regs);
@@ -265,6 +278,8 @@ void gdb_handle_g_commands(gdbctx *ctx, char *buf, size_t n) {
 
 // TODO: Set thread for current operations
 void gdb_handle_h_set_commands(gdbctx *ctx, char *buf, size_t n) {
+  UNUSED(n);
+
   if (starts_with(buf, "g")) {
     gdb_send_packet(ctx, "OK");
   } else if (starts_with(buf, "c")) {
@@ -312,7 +327,7 @@ void gdb_handle_m_commands(gdbctx *ctx, char *buf, size_t n) {
       GDB_PRINTF("p[%d] = %x != addr[%d] = %x\n", i, p[i], i, addr[i]);
 
   data[sz * 2] = '\0';
-  GDB_PRINTF("MEMORY: %p[%ld]: %s\n", addr, sz, data);
+  // GDB_PRINTF("MEMORY: %p[%ld]: %s\n", addr, sz, data);
 
   gdb_send_packet(ctx, data);
 }
@@ -357,18 +372,10 @@ void gdb_handle_m_set_commands(gdbctx *ctx, char *buf, size_t n) {
 void gdb_handle_p_set_commands(gdbctx *ctx, char *buf, size_t n) {
   char *endptr = buf + n;
 
-  int status;
-  if (!ctx->stopped) {
-    xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
-    waitpid(ctx->ppid, &status, 0);
-    ctx->stopped = 1;
-  }
+  if (!ctx->stopped)
+    gdb_pause(ctx);
 
-  ctx->regs->rax = 0;
-  ctx->fpregs->cwd = 0;
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-
+  gdb_save_state(ctx);
   size_t regid = strtoull(buf, &endptr, 0x10);
 
   buf = endptr;
@@ -550,21 +557,20 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
 }
 
 void gdb_handle_s_commands(gdbctx *ctx, char *buf, size_t n) {
+  UNUSED(buf);
+  UNUSED(n);
   int status;
+
+  if (!ctx->stopped)
+    gdb_pause(ctx);
   xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
-  ctx->stopped = 1;
-
-  ctx->regs->rax = 0;
-  ctx->fpregs->cwd = 0;
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  pbvt_commit();
-
   gdb_send_packet(ctx, "S05");
 }
 
 void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
+  UNUSED(n);
+
   if (starts_with(buf, "MustReplyEmpty")) {
     gdb_send_empty(ctx);
   } else if (starts_with(buf, "File")) {
@@ -662,13 +668,8 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
   } else if (starts_with(buf, "Cont")) {
     GDB_PRINTF("Assuming continue... %d\n", ctx->ppid);
 
-    ctx->regs->rax = 0;
-    ctx->fpregs->cwd = 0;
-    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-    xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-
-    xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
-    ctx->stopped = 0;
+    gdb_save_state(ctx);
+    gdb_continue(ctx);
 
     // TODO: Is this correct?
     // gdb_send_empty(ctx);

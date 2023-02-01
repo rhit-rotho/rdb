@@ -26,7 +26,6 @@
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define PROCMAPS_LINE_MAX_LENGTH (PATH_MAX + 100)
-#define UNUSED(x) (void)(x)
 
 void *gdbstub_stk;
 pid_t ppid;
@@ -73,6 +72,10 @@ int gdbstub(void *args) {
   pbvt_init();
 
   signal(SIGSEGV, sighandler);
+
+  // GDB_PRINTF("Press [enter] to continue...\n", 0);
+  // char t;
+  // read(0, &t, 1);
 
   char path[PATH_MAX];
   snprintf(path, PATH_MAX, "/proc/%d/maps", ppid);
@@ -136,8 +139,7 @@ int gdbstub(void *args) {
   ctx->stopped = 1;
   ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
   ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
-
-  pbvt_commit();
+  gdb_save_state(ctx);
 
   int gdb_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (gdb_socket < 0)
@@ -172,10 +174,12 @@ int gdbstub(void *args) {
 
   int timerfd = timerfd_create(CLOCK_REALTIME, 0);
   struct itimerspec arm = {0};
-  arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 10;
-  arm.it_value.tv_sec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 10;
+  arm.it_interval.tv_sec = 10;
+  arm.it_interval.tv_nsec = 0;
+  // arm.it_interval.tv_nsec = 1000 * 1000 * 10;
+  arm.it_value.tv_sec = 10;
+  arm.it_value.tv_nsec = 0;
+  // arm.it_value.tv_nsec = 1000 * 1000 * 10;
   if (timerfd_settime(timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 
@@ -189,50 +193,68 @@ int gdbstub(void *args) {
 
   // TODO: Add signalfd for handling segfaults, syscalls, and signals
   struct pollfd pollfds[3] = {0};
-  pollfds[0].fd = timerfd;
+  pollfds[0].fd = cfd;
   pollfds[0].events = POLLIN | POLLERR;
-  pollfds[1].fd = cfd;
+  pollfds[1].fd = sfd;
   pollfds[1].events = POLLIN | POLLERR;
-  pollfds[2].fd = sfd;
+  pollfds[2].fd = timerfd;
   pollfds[2].events = POLLIN | POLLERR;
 
   char gdb_buf[0x100];
 
-  ctx->regs->rax = 0;
-  ctx->fpregs->cwd = 0;
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  pbvt_commit();
-
   size_t snap_counter = 0;
 
+  // Main event loop
   for (;;) {
     if (poll(pollfds, 3, -1) < 0)
       xperror("poll(wrapper)");
 
-    // Timer
+    // Socket
     if (pollfds[0].revents & POLLERR)
-      xperror("POLLERR in timer");
+      xperror("POLLERR in socket");
     if (pollfds[0].revents & POLLIN) {
-      uint64_t expiry;
-      read(pollfds[0].fd, &expiry, sizeof(expiry));
+      int nbytes = read(pollfds[0].fd, gdb_buf, sizeof(gdb_buf) - 1);
+      if (nbytes < 0)
+        xperror("read");
+      if (nbytes == 0)
+        break;
+      gdb_buf[nbytes] = '\0';
+      GDB_PRINTF("Remote: \"%s\", n: %d\n", gdb_buf, nbytes);
+      gdb_handle_packet(ctx, gdb_buf, nbytes);
+      continue;
+    }
 
+    // Process hit syscall, handle this before our timer in case the process is
+    // already stopped on a syscall.
+    if (pollfds[1].revents & POLLERR)
+      xperror("POLLERR in signalfd");
+    if (pollfds[1].revents & POLLIN) {
+      GDB_PRINTF("Handle signal\n", 0);
+      struct signalfd_siginfo ssi;
+      read(pollfds[1].fd, &ssi, sizeof(ssi));
+
+      // Stopped by GDB
       if (ctx->stopped)
         continue;
 
-      xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
+      GDB_PRINTF("ssi.ssi_signo: %d ssi.ssi_code: %d\n", ssi.ssi_signo,
+                 ssi.ssi_code);
+
       waitpid(ctx->ppid, &status, 0);
       ctx->stopped = 1;
+      gdb_save_state(ctx);
 
-      ctx->regs->rax = 0;
-      ctx->fpregs->cwd = 0;
-      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-      xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+      GDB_PRINTF("Entering syscall:\trax: %.16lx rdi: %.16lx rsi: "
+                 "%.16lx ...\n",
+                 ctx->regs->orig_rax, ctx->regs->rdi, ctx->regs->rsi);
 
-      pbvt_commit();
+      xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      gdb_save_state(ctx);
 
-      xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
-      ctx->stopped = 0;
+      GDB_PRINTF("Exiting syscall:\trax: %.16lx\n", ctx->regs->rax);
+
+      gdb_continue(ctx);
 
       snap_counter += 1;
       if (snap_counter % 100 == 0)
@@ -240,39 +262,23 @@ int gdbstub(void *args) {
       continue;
     }
 
-    // Socket
-    if (pollfds[1].revents & POLLERR)
-      xperror("POLLERR in socket");
-    if (pollfds[1].revents & POLLIN) {
-      int nbytes = read(pollfds[1].fd, gdb_buf, sizeof(gdb_buf) - 1);
-      if (nbytes < 0)
-        xperror("read");
-      if (nbytes == 0)
-        break;
-      gdb_buf[nbytes] = '\0';
-      GDB_PRINTF("Remote: \"%s\"\n", gdb_buf);
-      gdb_handle_packet(ctx, gdb_buf, nbytes);
-
-      continue;
-    }
-
-    // Process hit syscall
+    // Timer
     if (pollfds[2].revents & POLLERR)
-      xperror("POLLERR in signalfd");
+      xperror("POLLERR in timer");
     if (pollfds[2].revents & POLLIN) {
-      struct signalfd_siginfo si;
-      read(pollfds[2].fd, &si, sizeof(si));
+      uint64_t expiry;
+      read(pollfds[2].fd, &expiry, sizeof(expiry));
 
-      // ctx->regs->rax = 0;
-      // ctx->fpregs->cwd = 0;
-      // xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-      // xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-      // pbvt_commit();
-      // xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+      if (ctx->stopped)
+        continue;
 
-      // snap_counter += 1;
-      // if (snap_counter % 0x100 == 0)
-      //   pbvt_stats();
+      gdb_pause(ctx);
+      gdb_save_state(ctx);
+      gdb_continue(ctx);
+
+      snap_counter += 1;
+      if (snap_counter % 100 == 0)
+        pbvt_stats();
       continue;
     }
 

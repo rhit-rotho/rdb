@@ -7,16 +7,17 @@
 #define GDB_PRINTF_HEADER "\e[33m[gdb: %d, %s:%d]\e[0m "
 #define GDB_PRINTF_TRAILER ""
 
-#ifndef DEBUG
-#define DEBUG 1
-#endif
-
+#ifndef NDEBUG
 #define GDB_PRINTF(fmt, ...)                                                   \
   do {                                                                         \
-    if (DEBUG)                                                                 \
-      fprintf(stderr, GDB_PRINTF_HEADER fmt GDB_PRINTF_TRAILER, getpid(),      \
-              __FILE__, __LINE__, __VA_ARGS__);                                \
+    fprintf(stderr, GDB_PRINTF_HEADER fmt GDB_PRINTF_TRAILER, getpid(),        \
+            __FILE__, __LINE__, __VA_ARGS__);                                  \
   } while (0)
+#else
+#define GDB_PRINTF(fmt, ...)                                                   \
+  do {                                                                         \
+  } while (0)
+#endif
 
 #define xptrace(req, pid, addr, data)                                          \
   do {                                                                         \

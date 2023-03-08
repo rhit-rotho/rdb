@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <assert.h>
-#include <capstone/capstone.h>
 #include <fcntl.h>
 #include <intel-pt.h>
 #include <limits.h>
@@ -14,6 +13,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -31,6 +31,11 @@
 
 // #define CAPSTONE_DEBUG
 
+#ifdef CAPSTONE_DEBUG
+#include <capstone/capstone.h>
+#endif
+
+// TODO: Grab binary when first injecting into process
 #define APP_NAME "ptc"
 
 #define STACK_SIZE (8 * 1024 * 1024)
@@ -50,6 +55,10 @@
       x++;                                                                     \
   } while (0)
 
+// PSB, PSBEND
+uint8_t pt_prologue[] = {0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02,
+                         0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x23};
+
 void *gdbstub_stk;
 pid_t ppid;
 int fildes[2];
@@ -62,8 +71,11 @@ void sighandler(int signo) {
   exit(0);
 }
 
+#ifdef CAPSTONE_DEBUG
 csh handle;
-cs_insn tinsn;
+cs_insn *tinsn;
+#endif
+
 size_t insn_counter;
 int process_block(struct pt_block *block,
                   struct pt_image_section_cache *iscache, uint64_t *fip) {
@@ -116,9 +128,20 @@ int process_block(struct pt_block *block,
   return 0;
 }
 
-int process_full_trace(uint8_t *buf, size_t n,
+int handle_events(struct pt_block_decoder *decoder, int status) {
+  while (status & pts_event_pending) {
+    struct pt_event event;
+    status = pt_blk_event(decoder, &event, sizeof(event));
+    if (status < 0)
+      break;
+  }
+
+  return status;
+}
+
+int process_full_trace(uint8_t *buf, size_t n, gdbctx *ctx,
                        struct pt_image_section_cache *pim, int asid) {
-  // UNUSED(bitmap);
+  UNUSED(ctx);
 
   struct pt_block_decoder *decoder;
   struct pt_config config;
@@ -138,30 +161,26 @@ int process_full_trace(uint8_t *buf, size_t n,
     exit(-1);
   }
 
-  uint64_t fip = 0xbad0bad0bad0bad0;
-  int wstatus = pt_blk_sync_forward(decoder);
-  if (wstatus < 0) {
-    GDB_PRINTF("%s\n", pt_errstr(-wstatus));
-    return -1;
-  }
-
+  int wstatus;
+  uint64_t fip = 0xdeadbeefdeadbeef;
   for (;;) {
+    wstatus = pt_blk_sync_forward(decoder);
+    if (wstatus < 0)
+      break;
+
     for (;;) {
       struct pt_block block;
       int errcode;
 
       wstatus = handle_events(decoder, wstatus);
-      if (wstatus < 0) {
-        // fip = __LINE__;
+      if (wstatus < 0)
         break;
-      }
 
       wstatus = pt_blk_next(decoder, &block, sizeof(block));
       errcode = process_block(&block, pim, &fip);
-      if (wstatus == -pte_eos) {
-        // fip = __LINE__;
+      if (wstatus == -pte_eos)
         break;
-      }
+
       if (errcode < 0)
         wstatus = errcode;
       if (wstatus < 0)
@@ -169,37 +188,16 @@ int process_full_trace(uint8_t *buf, size_t n,
     }
     if (wstatus == -pte_eos)
       break;
-    if (wstatus < 0) {
-      GDB_PRINTF("%s\n", wstatus, pt_errstr(wstatus));
+    if (wstatus < 0)
       break;
-    }
-
-    wstatus = pt_blk_sync_forward(decoder);
-    if (wstatus < 0) {
-      GDB_PRINTF("%s\n", pt_errstr(-wstatus));
-      break;
-    }
   }
 
-  GDB_PRINTF("Final ip from decode: 0x%.16lx\n", fip);
-  GDB_PRINTF("Finished processing %d instructions.\n", insn_counter);
+  // GDB_PRINTF("Final ip from decode: 0x%.16lx\n", fip);
+  // GDB_PRINTF("Finished processing %d instructions.\n", insn_counter);
 
   pt_blk_free_decoder(decoder);
 
   return 0;
-}
-
-int handle_events(struct pt_block_decoder *decoder, int status) {
-  while (status & pts_event_pending) {
-    struct pt_event event;
-
-    status = pt_blk_event(decoder, &event, sizeof(event));
-    if (status < 0)
-      break;
-    // GDB_PRINTF("event: %d\n", event.type);
-  }
-
-  return status;
 }
 
 int read_line(int fd, char *buf, size_t n) {
@@ -327,7 +325,8 @@ int gdbstub(void *args) {
   ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
 
   // TODO: Calculate this based on size of executable memory
-  ctx->bitmap = pbvt_calloc(0x1000, sizeof(uint8_t));
+  ctx->counters = pbvt_calloc(0x1000, sizeof(uint64_t));
+  ctx->counters_sz = 0x1000;
   gdb_save_state(ctx);
 
   xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
@@ -367,7 +366,10 @@ int gdbstub(void *args) {
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;
   UNUSED(data);
-  int n = 0, m = 32; // data size, aux size
+  // data size, aux size
+  // TODO: Make sure that we *always* snapshot often enough that we never
+  // overfill our aux buffer, otherwise we'll stop dropping samples
+  int n = 0, m = 16;
 
   base = mmap(NULL, (1 + 2 * n) * PAGE_SIZE, PROT_WRITE, MAP_SHARED, pfd, 0);
   if (base == MAP_FAILED)
@@ -386,9 +388,6 @@ int gdbstub(void *args) {
   if (aux == MAP_FAILED)
     xperror("mmap");
 
-  int xstatus;
-  insn_counter = 0;
-
 #ifdef CAPSTONE_DEBUG
   if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
     GDB_PRINTF("cs_open: %s\n", cs_strerror(cs_errno(handle)));
@@ -397,32 +396,49 @@ int gdbstub(void *args) {
   cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
   tinsn = cs_malloc(handle);
 #endif
-  uint8_t ptbuf[0x10000];
 
-  xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
-  waitpid(ctx->ppid, &xstatus, 0);
-  if (ioctl(pfd, PERF_EVENT_IOC_DISABLE, 0) < 0)
-    xperror("ioctl(PERF_EVENT_IOC_DISABLE)");
+  int xstatus;
+  uint8_t ptbuf[0x1000];
 
-  memcpy(ptbuf, aux + header->aux_tail, header->aux_head - header->aux_tail);
-  for (int i = 0; i < header->aux_head - header->aux_tail; ++i) {
-    printf("%.2x ", ((uint8_t *)ptbuf)[i]);
-  }
-  printf("\n");
-
-  GDB_PRINTF("%.16lx %.16lx\n", header->aux_tail, header->aux_head);
-
-  struct user_regs_struct xregs = {0};
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
-  // Back up one, since we hit a trap
-  GDB_PRINTF("Process ended at rip: 0x%0.16lx\n", xregs.rip - 1);
-
-  process_full_trace(ptbuf, header->aux_head - header->aux_tail, pim, asid);
-  header->aux_tail = header->aux_head;
-
-  for (int i = 0; i < 3; ++i) {
+  for (;;) {
+    insn_counter = 0;
+    if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0)
+      xperror("ioctl(PERF_EVENT_IOC_ENABLE)");
     xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
     waitpid(ctx->ppid, &xstatus, 0);
+    if (ioctl(pfd, PERF_EVENT_IOC_DISABLE, 0) < 0)
+      xperror("ioctl(PERF_EVENT_IOC_DISABLE)");
+
+    size_t trace_sz = 0;
+    if (header->aux_tail < header->aux_head) {
+      trace_sz = header->aux_head - header->aux_tail;
+      memcpy(ptbuf, aux + header->aux_tail,
+             header->aux_head - header->aux_tail);
+    } else {
+      // Handle wrap-around
+      trace_sz = (header->aux_head) + (header->aux_size - header->aux_tail);
+      memcpy(ptbuf, aux + header->aux_tail,
+             header->aux_size - header->aux_tail);
+      memcpy(ptbuf + (header->aux_size - header->aux_tail), aux,
+             header->aux_head);
+    }
+
+    // Check if aux starts with PSB
+    if (memcmp(ptbuf, pt_prologue, 16) != 0) {
+      memmove(ptbuf + sizeof(pt_prologue), ptbuf, trace_sz);
+      memcpy(ptbuf, pt_prologue, sizeof(pt_prologue));
+      trace_sz += sizeof(pt_prologue);
+    }
+
+    GDB_PRINTF("Read from %p to %p\n", header->aux_tail, header->aux_head);
+
+    struct user_regs_struct xregs = {0};
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+    // Back up one, since we hit a trap
+    // GDB_PRINTF("Process ended at rip: 0x%0.16lx\n", xregs.rip - 1);
+
+    process_full_trace(ptbuf, trace_sz, ctx, pim, asid);
+    header->aux_tail = header->aux_head;
   }
 
   return 0;

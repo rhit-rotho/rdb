@@ -39,6 +39,10 @@ typedef struct gdbctx {
   volatile struct user_regs_struct *regs;
   volatile struct user_fpregs_struct *fpregs;
   int stopped;
+  uint64_t *counters;
+  uint64_t counters_sz;
+  // Breakpoint bps[0x10];
+  // size_t n_bps;
 } gdbctx;
 
 uint8_t gdb_checksum(char *c, size_t n);

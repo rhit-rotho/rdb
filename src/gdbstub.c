@@ -34,6 +34,7 @@ void gdb_continue(gdbctx *ctx) {
 }
 
 void gdb_save_state(gdbctx *ctx) {
+  // ctx->sketch is saved automatically :)
   ctx->regs->rax = 0;
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);

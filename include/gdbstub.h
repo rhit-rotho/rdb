@@ -45,8 +45,17 @@ typedef struct gdbctx {
   volatile struct user_regs_struct *regs;
   volatile struct user_fpregs_struct *fpregs;
   int stopped;
+
   uint64_t *sketch[SKETCH_COL];
   uint64_t sketch_sz;
+
+  struct perf_event_mmap_page *header;
+  void *base, *data, *aux;
+  int pfd;
+
+  struct pt_image_section_cache *pim;
+  int asid;
+  
   // Breakpoint bps[0x10];
   // size_t n_bps;
 } gdbctx;

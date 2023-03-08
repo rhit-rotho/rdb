@@ -30,15 +30,13 @@
 #include "gdbstub.h"
 #include "pbvt.h"
 
+#define PT_DEBUG
+
 // TODO: Grab binary when first injecting into process
 #define APP_NAME "test-app"
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define PROCMAPS_LINE_MAX_LENGTH (PATH_MAX + 100)
-
-#define HCOUNTER_ROWS (0x4)
-#define HCOUNTER_COLS (0x1000)
-#define COUNTER_SIZE (0x1000)
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -148,8 +146,7 @@ int handle_events(struct pt_block_decoder *decoder, int status) {
   return status;
 }
 
-int process_full_trace(uint8_t *buf, size_t n, gdbctx *ctx,
-                       struct pt_image_section_cache *pim, int asid) {
+int pt_process_trace(uint8_t *buf, size_t n, gdbctx *ctx) {
   UNUSED(ctx);
 
   struct pt_block_decoder *decoder;
@@ -164,9 +161,10 @@ int process_full_trace(uint8_t *buf, size_t n, gdbctx *ctx,
 
   decoder = pt_blk_alloc_decoder(&config);
   int pim_status =
-      pt_image_add_cached(pt_blk_get_image(decoder), pim, asid, NULL);
+      pt_image_add_cached(pt_blk_get_image(decoder), ctx->pim, ctx->asid, NULL);
   if (pim_status < 0) {
-    GDB_PRINTF("pt_image_add_cached(%d): %s\n", asid, pt_errstr(pim_status));
+    GDB_PRINTF("pt_image_add_cached(%d): %s\n", ctx->asid,
+               pt_errstr(pim_status));
     exit(-1);
   }
 
@@ -186,7 +184,7 @@ int process_full_trace(uint8_t *buf, size_t n, gdbctx *ctx,
         break;
 
       wstatus = pt_blk_next(decoder, &block, sizeof(block));
-      errcode = process_block(&block, pim, &fip, ctx);
+      errcode = process_block(&block, ctx->pim, &fip, ctx);
       if (wstatus == -pte_eos)
         break;
 
@@ -207,6 +205,126 @@ int process_full_trace(uint8_t *buf, size_t n, gdbctx *ctx,
   pt_blk_free_decoder(decoder);
 
   return 0;
+}
+
+int pt_init(gdbctx *ctx) {
+  struct perf_event_attr attr = {0};
+  attr.size = sizeof(attr);
+
+  attr.exclude_kernel = 1;
+  attr.exclude_hv = 1;
+  attr.exclude_idle = 1;
+
+  // TODO: Replace with read to /sys/bus/event_source/devices/intel_pt/type
+  attr.type = 8;
+
+  attr.config = 0;
+  // /sys/bus/event_source/devices/intel_pt/format/pt
+  attr.config |= 1 << 0;
+  // /sys/bus/event_source/devices/intel_pt/format/tsc
+  attr.config |= 1 << 10;
+  // /sys/bus/event_source/devices/intel_pt/format/branch
+  attr.config |= 1 << 13;
+  // /sys/bus/event_source/devices/intel_pt/format/psb_period
+  // PSB period: expect every 2**(value+11) bytes
+  attr.config |= 0 << 24;
+
+  attr.disabled = 1;
+
+  ctx->pfd = syscall(SYS_perf_event_open, &attr, ctx->ppid, -1, -1, 0);
+  if (ctx->pfd < 0)
+    xperror("SYS_perf_event_open");
+
+  // TODO: Make sure that we *always* snapshot often enough that we never
+  // overfill our aux buffer, otherwise we'll stop dropping samples
+
+  // data size, aux size
+  int n = 0, m = 16;
+
+  ctx->base =
+      mmap(NULL, (1 + 2 * n) * PAGE_SIZE, PROT_WRITE, MAP_SHARED, ctx->pfd, 0);
+  if (ctx->base == MAP_FAILED)
+    xperror("mmap");
+
+  ctx->header = ctx->base;
+  ctx->data = ctx->base + ctx->header->data_offset;
+
+  ctx->header->aux_offset = ctx->header->data_offset + ctx->header->data_size;
+  ctx->header->aux_size = (2 * m) * PAGE_SIZE;
+
+  // PROT_READ - circular buffer
+  // PROT_READ|PROT_WRITE - linear buffer
+  ctx->aux = mmap(NULL, ctx->header->aux_size, PROT_READ, MAP_SHARED, ctx->pfd,
+                  ctx->header->aux_offset);
+  if (ctx->aux == MAP_FAILED)
+    xperror("mmap");
+
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
+    GDB_PRINTF("cs_open: %s\n", cs_strerror(cs_errno(handle)));
+    return -1;
+  }
+  cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+  tinsn = cs_malloc(handle);
+
+  return 0;
+}
+
+void pt_update_sketch(gdbctx *ctx) {
+  uint8_t ptbuf[0x1000];
+  size_t trace_sz = 0;
+
+  if (ctx->header->aux_tail < ctx->header->aux_head) {
+    trace_sz = ctx->header->aux_head - ctx->header->aux_tail;
+    assert(trace_sz < sizeof(ptbuf));
+    memcpy(ptbuf, ctx->aux + ctx->header->aux_tail,
+           ctx->header->aux_head - ctx->header->aux_tail);
+  } else {
+    // Handle wrap-around
+    trace_sz = (ctx->header->aux_head) +
+               (ctx->header->aux_size - ctx->header->aux_tail);
+    assert(trace_sz < sizeof(ptbuf));
+    memcpy(ptbuf, ctx->aux + ctx->header->aux_tail,
+           ctx->header->aux_size - ctx->header->aux_tail);
+    memcpy(ptbuf + (ctx->header->aux_size - ctx->header->aux_tail), ctx->aux,
+           ctx->header->aux_head);
+  }
+
+  // Check if aux starts with PSB
+  if (memcmp(ptbuf, pt_prologue, 16) != 0) {
+    memmove(ptbuf + sizeof(pt_prologue), ptbuf, trace_sz);
+    memcpy(ptbuf, pt_prologue, sizeof(pt_prologue));
+    trace_sz += sizeof(pt_prologue);
+  }
+
+#ifdef PT_DEBUG
+  GDB_PRINTF("Read from %p to %p\n", ctx->header->aux_tail,
+             ctx->header->aux_head);
+#endif
+
+  struct user_regs_struct xregs = {0};
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+
+  memset(ctx->sketch[0], 0x00, SKETCH_COL * ctx->sketch_sz * sizeof(uint64_t));
+  pt_process_trace(ptbuf, trace_sz, ctx);
+
+#ifdef PT_DEBUG
+  uint64_t ip = 0x00555555554000 + 0x1227;
+  while (ip < 0x00555555554000 + 0x45be + 0x5) {
+    const uint8_t *code = (uint8_t *)ip;
+    uint64_t address = ip;
+    // max size of x86 insn is 15 bytes
+    size_t sz = 0x10;
+    if (!cs_disasm_iter(handle, &code, &sz, &address, tinsn)) {
+      GDB_PRINTF("cs_disasm_iter: %s\n", cs_strerror(cs_errno(handle)));
+      break;
+    }
+    GDB_PRINTF("0x%.16lx[%d]:\t%s\t%s\n", ip, insn_hit_count_get(ctx, ip),
+               tinsn->mnemonic, tinsn->op_str);
+    ip += tinsn->size;
+  }
+#endif
+
+  ctx->header->aux_tail = ctx->header->aux_head;
 }
 
 int read_line(int fd, char *buf, size_t n) {
@@ -325,6 +443,7 @@ int gdbstub(void *args) {
   pbvt_commit();
   pbvt_branch_commit("main");
 
+  // Initialize gdbctx
   gdbctx gctx = {0};
   gdbctx *ctx = &gctx;
 
@@ -338,6 +457,7 @@ int gdbstub(void *args) {
   uint64_t *alloc = pbvt_calloc(ctx->sketch_sz * SKETCH_COL, sizeof(uint64_t));
   for (int i = 0; i < SKETCH_COL; ++i)
     ctx->sketch[i] = &alloc[i * ctx->sketch_sz];
+
   gdb_save_state(ctx);
 
   xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
@@ -347,116 +467,26 @@ int gdbstub(void *args) {
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   GDB_PRINTF("rip: %p\n", ctx->regs->rip);
 
-  struct perf_event_attr attr = {0};
-  attr.size = sizeof(attr);
-
-  attr.exclude_kernel = 1;
-  attr.exclude_hv = 1;
-  attr.exclude_idle = 1;
-
-  // TODO: Replace with read to /sys/bus/event_source/devices/intel_pt/type
-  attr.type = 8;
-
-  attr.config = 0;
-  // /sys/bus/event_source/devices/intel_pt/format/pt
-  attr.config |= 1 << 0;
-  // /sys/bus/event_source/devices/intel_pt/format/tsc
-  attr.config |= 1 << 10;
-  // /sys/bus/event_source/devices/intel_pt/format/branch
-  attr.config |= 1 << 13;
-  // /sys/bus/event_source/devices/intel_pt/format/psb_period
-  // PSB period: expect every 2**(value+11) bytes
-  attr.config |= 0 << 24;
-
-  attr.disabled = 1;
-
-  int pfd = syscall(SYS_perf_event_open, &attr, ctx->ppid, -1, -1, 0);
-  if (pfd < 0)
-    xperror("SYS_perf_event_open");
-
-  struct perf_event_mmap_page *header;
-  void *base, *data, *aux;
-  UNUSED(data);
-  // data size, aux size
-  // TODO: Make sure that we *always* snapshot often enough that we never
-  // overfill our aux buffer, otherwise we'll stop dropping samples
-  int n = 0, m = 16;
-
-  base = mmap(NULL, (1 + 2 * n) * PAGE_SIZE, PROT_WRITE, MAP_SHARED, pfd, 0);
-  if (base == MAP_FAILED)
-    xperror("mmap");
-
-  header = base;
-  data = base + header->data_offset;
-
-  header->aux_offset = header->data_offset + header->data_size;
-  header->aux_size = (2 * m) * PAGE_SIZE;
-
-  // PROT_READ - circular buffer
-  // PROT_READ|PROT_WRITE - linear buffer
-  aux = mmap(NULL, header->aux_size, PROT_READ, MAP_SHARED, pfd,
-             header->aux_offset);
-  if (aux == MAP_FAILED)
-    xperror("mmap");
-
-  if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
-    GDB_PRINTF("cs_open: %s\n", cs_strerror(cs_errno(handle)));
-    return -1;
-  }
-  cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-  tinsn = cs_malloc(handle);
+  pt_init(ctx);
+  ctx->pim = pim;
+  ctx->asid = asid;
 
   int xstatus;
-  uint8_t ptbuf[0x1000];
 
   for (;;) {
     insn_counter = 0;
-    if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0)
+    if (ioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0) < 0)
       xperror("ioctl(PERF_EVENT_IOC_ENABLE)");
     xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
     waitpid(ctx->ppid, &xstatus, 0);
-    if (ioctl(pfd, PERF_EVENT_IOC_DISABLE, 0) < 0)
+    if (ioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0) < 0)
       xperror("ioctl(PERF_EVENT_IOC_DISABLE)");
 
-    size_t trace_sz = 0;
-    if (header->aux_tail < header->aux_head) {
-      trace_sz = header->aux_head - header->aux_tail;
-      assert(trace_sz < sizeof(ptbuf));
-      memcpy(ptbuf, aux + header->aux_tail,
-             header->aux_head - header->aux_tail);
-    } else {
-      // Handle wrap-around
-      trace_sz = (header->aux_head) + (header->aux_size - header->aux_tail);
-      assert(trace_sz < sizeof(ptbuf));
-      memcpy(ptbuf, aux + header->aux_tail,
-             header->aux_size - header->aux_tail);
-      memcpy(ptbuf + (header->aux_size - header->aux_tail), aux,
-             header->aux_head);
-    }
-
-    // Check if aux starts with PSB
-    if (memcmp(ptbuf, pt_prologue, 16) != 0) {
-      memmove(ptbuf + sizeof(pt_prologue), ptbuf, trace_sz);
-      memcpy(ptbuf, pt_prologue, sizeof(pt_prologue));
-      trace_sz += sizeof(pt_prologue);
-    }
-
-    GDB_PRINTF("Read from %p to %p\n", header->aux_tail, header->aux_head);
-
-    struct user_regs_struct xregs = {0};
-    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
-
-    memset(ctx->sketch[0], 0x00,
-           SKETCH_COL * ctx->sketch_sz * sizeof(uint64_t));
-    process_full_trace(ptbuf, trace_sz, ctx, pim, asid);
-    header->aux_tail = header->aux_head;
+    pt_update_sketch(ctx);
+    pbvt_commit();
   }
 
   return 0;
-
-  uint64_t rd_val;
-  int nbytes = read(pfd, &rd_val, sizeof(rd_val));
-  printf("read: %d %d\n", nbytes, rd_val);
 
   int gdb_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (gdb_socket < 0)

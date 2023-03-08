@@ -1,3 +1,5 @@
+#pragma once
+
 #include <errno.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -5,6 +7,8 @@
 #define UNUSED(x) (void)(x)
 
 #define SKETCH_COL (4)
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #define GDB_PRINTF_HEADER "\e[33m[gdb: %d, %s:%d]\e[0m "
 #define GDB_PRINTF_TRAILER ""

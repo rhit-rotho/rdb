@@ -33,6 +33,10 @@
     exit(-1);                                                                  \
   } while (0);
 
+typedef struct Breakpoint {
+  uintptr_t ip;
+} Breakpoint;
+
 typedef struct gdbctx {
   int fd;
   pid_t ppid;

@@ -33,7 +33,7 @@ PROGRAM                = libwrapper.so
 EXTRA_CFLAGS           = -fPIC -static-pie -fdata-sections -ffunction-sections -fno-builtin -nostdlib -g2 -gdwarf-3
 
 # The extra linker options, e.g. "-lmysqlclient -lz"
-EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt
+EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt -lipt
 
 # Specify the include dirs, e.g. "-I/usr/include/mysql -I./include -I/usr/include -I/usr/local/include".
 INCLUDE                = -Iinclude
@@ -90,8 +90,8 @@ HDREXTS = .h .H .hh .hpp .HPP .h++ .hxx .hp
 
 # The pre-processor and compiler options.
 # Users can override those variables from the command line.
-CFLAGS  = -O2
-CXXFLAGS= -O2
+CFLAGS  = #-DNDEBUG# -O2 # -DNDEBUG
+CXXFLAGS= #-DNDEBUG# -O2 # -DNDEBUG
 
 # The command used to delete file.
 RM     = rm -f

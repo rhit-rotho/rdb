@@ -1,17 +1,18 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/perf_event.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 
 #include "gdbstub.h"
 #include "pbvt.h"
-
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#include "pt.h"
 
 static char *chars = "0123456789abcdef";
 
@@ -25,10 +26,15 @@ void gdb_pause(gdbctx *ctx) {
   int status;
   xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
+  if (ioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0) < 0)
+    xperror("ioctl(PERF_EVENT_IOC_DISABLE)");
+  pt_update_sketch(ctx);
   ctx->stopped = 1;
 }
 
 void gdb_continue(gdbctx *ctx) {
+  if (ioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0) < 0)
+    xperror("ioctl(PERF_EVENT_IOC_ENABLE)");
   xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
   ctx->stopped = 0;
 }
@@ -40,6 +46,7 @@ void gdb_save_state(gdbctx *ctx) {
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
   pbvt_commit();
+  memset(ctx->sketch[0], 0x00, SKETCH_COL * ctx->sketch_sz * sizeof(uint64_t));
 }
 
 uint8_t gdb_checksum(char *c, size_t n) {
@@ -103,7 +110,7 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
   if (buf == endptr)
     return;
 
-  if (*buf == '+')
+  while (*buf == '+')
     buf += 1;
 
   if (buf == endptr)
@@ -154,7 +161,9 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
   case 'G':
   case 'p':
   case 'Z':
+    return gdb_handle_z_add_commands(ctx, buf, n);
   case 'z':
+    return gdb_handle_z_del_commands(ctx, buf, n);
   case 'T':
   case 'Q':
   default:
@@ -173,11 +182,18 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     if (!ctx->stopped)
       gdb_pause(ctx);
 
+    // gdb_save_state(ctx);
+
+    for (size_t i = 0; i < ctx->bps_sz; ++i) {
+      GDB_PRINTF("Hit %p %d times since the last checkpoint\n", ctx->bps[i].ip,
+                 insn_hit_count_get(ctx, ctx->bps[i].ip));
+    }
+
     GDB_PRINTF("Checking out to %.16lx\n", pbvt_head()->parent->current->hash);
     pbvt_checkout(pbvt_head()->parent);
 
-    ptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
-    ptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+    xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+    xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
     gdb_send_packet(ctx, "S05"); // sigtrap x86
     break;
   }
@@ -188,8 +204,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     }
 
     pbvt_checkout(pbvt_commit_parent(pbvt_head()));
-    ptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
-    ptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+    xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+    xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
     gdb_send_packet(ctx, "S05"); // sigtrap x86
     break;
   }
@@ -310,6 +326,7 @@ void gdb_handle_m_commands(gdbctx *ctx, char *buf, size_t n) {
   uint64_t words[0x200];
   size_t m = 0;
   for (size_t t = 0; t < sz; t += sizeof(uint64_t)) {
+    // TODO: This is a dumb quirk of ptrace, check that word is not -1
     uint64_t word = ptrace(PTRACE_PEEKDATA, ctx->ppid, addr + t, NULL);
     if (word == UINT64_MAX) {
       gdb_send_packet(ctx, "E14");
@@ -458,7 +475,7 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
   if (starts_with(buf, "Supported")) {
     gdb_send_packet(ctx, "PacketSize=47ff;ReverseStep+;ReverseContinue+;qXfer:"
                          "exec-file:read+;qXfer:features:read+;qXfer:libraries-"
-                         "svr4:read+;qXfer:auxv:read+;swbreak-");
+                         "svr4:read+;qXfer:auxv:read+;swbreak+");
   } else if (starts_with(buf, "TStatus")) {
     gdb_send_empty(ctx);
   } else if (starts_with(buf, "Offsets")) {
@@ -675,4 +692,71 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
     // TODO: Is this correct?
     // gdb_send_empty(ctx);
   }
+}
+
+void gdb_handle_z_add_commands(gdbctx *ctx, char *buf, size_t n) {
+  char *endptr;
+  size_t type = strtoull(buf, &endptr, 0x10);
+  buf = endptr + 1;
+  void *addr = (void *)strtoull(buf, &endptr, 0x10);
+  buf = endptr + 1;
+  size_t kind = strtoull(buf, &endptr, 0x10);
+  buf = endptr;
+
+  UNUSED(type);
+  UNUSED(kind);
+
+  // TODO: Make bps resiable, send correct error code
+  if (ctx->bps_sz + 1 >= sizeof(ctx->bps) / sizeof(ctx->bps[0])) {
+    gdb_send_packet(ctx, "E5");
+    return;
+  }
+
+  ctx->bps[ctx->bps_sz].ip = addr;
+  GDB_PRINTF("Write trap to %p\n", addr);
+  uint8_t data[4];
+  memcpy(data, (uintptr_t)addr & ~0x3, 4);
+  memcpy(&ctx->bps[ctx->bps_sz].patch, data, 4);
+  data[(uintptr_t)addr & 0x3] = 0xcc;
+  xptrace(PTRACE_POKEDATA, ctx->ppid, (uintptr_t)addr & ~0x3,
+          *(uint32_t *)data);
+  assert(*(uint8_t *)addr == 0xcc);
+  ctx->bps_sz += 1;
+  return gdb_send_packet(ctx, "OK");
+}
+
+void gdb_handle_z_del_commands(gdbctx *ctx, char *buf, size_t n) {
+  char *endptr;
+  size_t type = strtoull(buf, &endptr, 0x10);
+  buf = endptr + 1;
+  void *addr = (void *)strtoull(buf, &endptr, 0x10);
+  buf = endptr + 1;
+  size_t kind = strtoull(buf, &endptr, 0x10);
+  buf = endptr;
+
+  UNUSED(type);
+  UNUSED(kind);
+
+  Breakpoint *bp = NULL;
+  size_t pos = 0;
+  // for (size_t i = 0; i < ctx->bps_sz; ++i) {
+  //   if (ctx->bps[i].ip == addr) {
+  //     bp = &ctx->bps[i];
+  //     xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~0x3, bp->patch);
+  //     pos = i;
+  //     break;
+  //   }
+  // }
+
+  // TODO: Send correct error
+  if (!bp) {
+    gdb_send_packet(ctx, "E5");
+    return;
+  }
+
+  // for (size_t i = pos; i < ctx->bps_sz - 1; ++i)
+  //   ctx->bps[i] = ctx->bps[i + 1];
+  // ctx->bps_sz -= 1;
+
+  return gdb_send_packet(ctx, "OK");
 }

@@ -143,11 +143,11 @@ int gdbstub(void *args) {
     if (strstr(name, "libpbvt.so") != NULL)
       continue;
 
-    if (strcmp(name, "[heap]") == 0) {
-      GDB_PRINTF("[heap] %s %lx-%lx\n", flags, from, to);
-      pbvt_track_range((void *)from, to - from, prot);
-      continue;
-    }
+    // if (strcmp(name, "[heap]") == 0) {
+    //   GDB_PRINTF("[heap] %s %lx-%lx\n", flags, from, to);
+    //   pbvt_track_range((void *)from, to - from, prot);
+    //   continue;
+    // }
 
     if (strcmp(name, "[stack]") == 0) {
       GDB_PRINTF("[stack] %s %lx-%lx\n", flags, from, to);
@@ -155,11 +155,14 @@ int gdbstub(void *args) {
       continue;
     }
 
-    if (strstr(name, APP_NAME) != NULL) {
-      GDB_PRINTF("[%s] %s %lx-%lx %s\n", APP_NAME, flags, from, to, name);
-      pbvt_track_range((void *)from, to - from, prot);
-      continue;
-    }
+    // TODO: This is broken currently. pbvt supports it but we do not, we need a
+    // way to check whether our target is segfaulting because we are controlling
+    // a region, or if it is a legitimate crash.
+    //  if (strstr(name, APP_NAME) != NULL) {
+    //    GDB_PRINTF("[%s] %s %lx-%lx %s\n", APP_NAME, flags, from, to, name);
+    //    pbvt_track_range((void *)from, to - from, prot);
+    //    continue;
+    //  }
 
     GDB_PRINTF("[ignore] %s %lx-%lx %s\n", flags, from, to, name);
   }
@@ -297,9 +300,35 @@ int gdbstub(void *args) {
       GDB_PRINTF("ssi.ssi_signo: %d ssi.ssi_code: %d\n", ssi.ssi_signo,
                  ssi.ssi_code);
 
+      // ptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
       waitpid(ctx->ppid, &status, 0);
       ctx->stopped = 1;
       gdb_save_state(ctx);
+
+      GDB_PRINTF("Status: %d, sig: %d\n", status, WSTOPSIG(status),
+                 WIFSTOPPED(status));
+
+      if (WSTOPSIG(status) == SIGTRAP) {
+        Breakpoint *bp = NULL;
+        for (int i = 0; i < ctx->bps_sz; ++i) {
+          if (ctx->regs->rip - 1 == ctx->bps[i].ip) {
+            bp = &ctx->bps[i];
+            break;
+          }
+        }
+
+        if (bp) {
+          GDB_PRINTF("Hit breakpoint! RIP: %.16lx BP: %.16lx\n",
+                     ctx->regs->rip - 1, bp->ip);
+          ctx->regs->rip -= 1;
+          xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+          xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~0x3, bp->patch);
+          gdb_send_packet(ctx, "S05");
+          continue;
+        }
+      } else if (WSTOPSIG(status) == SIGSEGV) {
+        abort();
+      }
 
       GDB_PRINTF("Entering syscall:\trax: %.16lx rdi: %.16lx rsi: "
                  "%.16lx ...\n",
@@ -313,9 +342,9 @@ int gdbstub(void *args) {
 
       gdb_continue(ctx);
 
-      snap_counter += 1;
-      if (snap_counter % 100 == 0)
-        pbvt_stats();
+      // snap_counter += 1;
+      // if (snap_counter % 100 == 0)
+      //   pbvt_stats();
       continue;
     }
 
@@ -323,7 +352,6 @@ int gdbstub(void *args) {
     if (pollfds[2].revents & POLLERR)
       xperror("POLLERR in timer");
     if (pollfds[2].revents & POLLIN) {
-      printf("Handle trace!\n");
       uint64_t expiry;
       read(pollfds[2].fd, &expiry, sizeof(expiry));
 
@@ -334,9 +362,9 @@ int gdbstub(void *args) {
       gdb_save_state(ctx);
       gdb_continue(ctx);
 
-      snap_counter += 1;
-      if (snap_counter % 100 == 0)
-        pbvt_stats();
+      // snap_counter += 1;
+      // if (snap_counter % 100 == 0)
+      //   pbvt_stats();
       continue;
     }
 

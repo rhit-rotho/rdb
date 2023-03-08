@@ -41,6 +41,7 @@
 
 typedef struct Breakpoint {
   uintptr_t ip;
+  uint32_t patch;
 } Breakpoint;
 
 typedef struct gdbctx {
@@ -59,9 +60,9 @@ typedef struct gdbctx {
 
   struct pt_image_section_cache *pim;
   int asid;
-  
-  // Breakpoint bps[0x10];
-  // size_t n_bps;
+
+  Breakpoint bps[0x10];
+  size_t bps_sz;
 } gdbctx;
 
 uint8_t gdb_checksum(char *c, size_t n);
@@ -86,3 +87,5 @@ void gdb_handle_p_set_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_s_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n);
+void gdb_handle_z_add_commands(gdbctx *ctx, char *buf, size_t n);
+void gdb_handle_z_del_commands(gdbctx *ctx, char *buf, size_t n);

@@ -4,6 +4,8 @@
 
 #define UNUSED(x) (void)(x)
 
+#define SKETCH_COL (4)
+
 #define GDB_PRINTF_HEADER "\e[33m[gdb: %d, %s:%d]\e[0m "
 #define GDB_PRINTF_TRAILER ""
 
@@ -43,8 +45,8 @@ typedef struct gdbctx {
   volatile struct user_regs_struct *regs;
   volatile struct user_fpregs_struct *fpregs;
   int stopped;
-  uint64_t *counters;
-  uint64_t counters_sz;
+  uint64_t *sketch[SKETCH_COL];
+  uint64_t sketch_sz;
   // Breakpoint bps[0x10];
   // size_t n_bps;
 } gdbctx;

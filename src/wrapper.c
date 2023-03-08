@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <assert.h>
+#include <capstone/capstone.h>
 #include <fcntl.h>
 #include <intel-pt.h>
 #include <limits.h>
@@ -29,14 +30,8 @@
 #include "gdbstub.h"
 #include "pbvt.h"
 
-// #define CAPSTONE_DEBUG
-
-#ifdef CAPSTONE_DEBUG
-#include <capstone/capstone.h>
-#endif
-
 // TODO: Grab binary when first injecting into process
-#define APP_NAME "ptc"
+#define APP_NAME "test-app"
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define PROCMAPS_LINE_MAX_LENGTH (PATH_MAX + 100)
@@ -63,6 +58,9 @@ void *gdbstub_stk;
 pid_t ppid;
 int fildes[2];
 
+csh handle;
+cs_insn *tinsn;
+
 void sighandler(int signo) {
   UNUSED(signo);
   GDB_PRINTF("pid:%d tid:%d ppid:%d I got the signal!\n", getpid(), gettid(),
@@ -71,14 +69,25 @@ void sighandler(int signo) {
   exit(0);
 }
 
-#ifdef CAPSTONE_DEBUG
-csh handle;
-cs_insn *tinsn;
-#endif
+void insn_hit_count_inc(gdbctx *ctx, uint64_t ip) {
+  for (int i = 0; i < SKETCH_COL; ++i)
+    ctx->sketch[i][fasthash64(&ip, sizeof(ip), i) % ctx->sketch_sz]++;
+}
+
+uint64_t insn_hit_count_get(gdbctx *ctx, uint64_t ip) {
+  uint64_t cnt =
+      ctx->sketch[0][fasthash64(&ip, sizeof(ip), 0) % ctx->sketch_sz];
+  for (int i = 1; i < SKETCH_COL; ++i) {
+    cnt = MIN(cnt,
+              ctx->sketch[i][fasthash64(&ip, sizeof(ip), i) % ctx->sketch_sz]);
+  }
+  return cnt;
+}
 
 size_t insn_counter;
 int process_block(struct pt_block *block,
-                  struct pt_image_section_cache *iscache, uint64_t *fip) {
+                  struct pt_image_section_cache *iscache, uint64_t *fip,
+                  gdbctx *ctx) {
   uint16_t ninsn;
   uint64_t ip;
 
@@ -107,7 +116,8 @@ int process_block(struct pt_block *block,
       insn.size = (uint8_t)size;
     }
 
-#ifdef CAPSTONE_DEBUG
+    insn_hit_count_inc(ctx, insn.ip);
+
     const uint8_t *code = (uint8_t *)ip;
     uint64_t address = ip;
     size_t sz = 0x10; // max size of x86 insn is 15 bytes
@@ -115,11 +125,10 @@ int process_block(struct pt_block *block,
       GDB_PRINTF("cs_disasm_iter: %s\n", cs_strerror(cs_errno(handle)));
       break;
     }
-    GDB_PRINTF("0x%.16lx:\t%s\t%s\n", insn.ip, tinsn->mnemonic, tinsn->op_str);
+    // GDB_PRINTF("0x%.16lx[%c]:\t%s\t%s\n", insn.ip, insn.speculative ? '?' :
+    // 'x',
+    //            tinsn->mnemonic, tinsn->op_str);
     ip += tinsn->size;
-#else
-    ip += insn.size;
-#endif
     insn_counter++;
   }
 
@@ -177,7 +186,7 @@ int process_full_trace(uint8_t *buf, size_t n, gdbctx *ctx,
         break;
 
       wstatus = pt_blk_next(decoder, &block, sizeof(block));
-      errcode = process_block(&block, pim, &fip);
+      errcode = process_block(&block, pim, &fip, ctx);
       if (wstatus == -pte_eos)
         break;
 
@@ -325,8 +334,10 @@ int gdbstub(void *args) {
   ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
 
   // TODO: Calculate this based on size of executable memory
-  ctx->counters = pbvt_calloc(0x1000, sizeof(uint64_t));
-  ctx->counters_sz = 0x1000;
+  ctx->sketch_sz = 0x4000;
+  uint64_t *alloc = pbvt_calloc(ctx->sketch_sz * SKETCH_COL, sizeof(uint64_t));
+  for (int i = 0; i < SKETCH_COL; ++i)
+    ctx->sketch[i] = &alloc[i * ctx->sketch_sz];
   gdb_save_state(ctx);
 
   xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
@@ -357,7 +368,7 @@ int gdbstub(void *args) {
   // PSB period: expect every 2**(value+11) bytes
   attr.config |= 0 << 24;
 
-  attr.disabled = 0;
+  attr.disabled = 1;
 
   int pfd = syscall(SYS_perf_event_open, &attr, ctx->ppid, -1, -1, 0);
   if (pfd < 0)
@@ -388,14 +399,12 @@ int gdbstub(void *args) {
   if (aux == MAP_FAILED)
     xperror("mmap");
 
-#ifdef CAPSTONE_DEBUG
   if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
     GDB_PRINTF("cs_open: %s\n", cs_strerror(cs_errno(handle)));
     return -1;
   }
   cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
   tinsn = cs_malloc(handle);
-#endif
 
   int xstatus;
   uint8_t ptbuf[0x1000];
@@ -412,11 +421,13 @@ int gdbstub(void *args) {
     size_t trace_sz = 0;
     if (header->aux_tail < header->aux_head) {
       trace_sz = header->aux_head - header->aux_tail;
+      assert(trace_sz < sizeof(ptbuf));
       memcpy(ptbuf, aux + header->aux_tail,
              header->aux_head - header->aux_tail);
     } else {
       // Handle wrap-around
       trace_sz = (header->aux_head) + (header->aux_size - header->aux_tail);
+      assert(trace_sz < sizeof(ptbuf));
       memcpy(ptbuf, aux + header->aux_tail,
              header->aux_size - header->aux_tail);
       memcpy(ptbuf + (header->aux_size - header->aux_tail), aux,
@@ -434,9 +445,9 @@ int gdbstub(void *args) {
 
     struct user_regs_struct xregs = {0};
     xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
-    // Back up one, since we hit a trap
-    // GDB_PRINTF("Process ended at rip: 0x%0.16lx\n", xregs.rip - 1);
 
+    memset(ctx->sketch[0], 0x00,
+           SKETCH_COL * ctx->sketch_sz * sizeof(uint64_t));
     process_full_trace(ptbuf, trace_sz, ctx, pim, asid);
     header->aux_tail = header->aux_head;
   }

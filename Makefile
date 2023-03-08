@@ -33,7 +33,7 @@ PROGRAM                = libwrapper.so
 EXTRA_CFLAGS           = -fPIC -static-pie -fdata-sections -ffunction-sections -fno-builtin -nostdlib -g2 -gdwarf-3
 
 # The extra linker options, e.g. "-lmysqlclient -lz"
-EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt -lipt
+EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt -lipt -lcapstone
 
 # Specify the include dirs, e.g. "-I/usr/include/mysql -I./include -I/usr/include -I/usr/local/include".
 INCLUDE                = -Iinclude

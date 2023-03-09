@@ -9,6 +9,9 @@
 #include "fasthash.h"
 #include "pt.h"
 
+#define PT_DEBUG
+#define AUX_SIZE (64)
+
 // PSB, PSBEND
 const uint8_t PT_PROLOGUE[] = {0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
                                0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
@@ -32,7 +35,6 @@ uint64_t insn_hit_count_get(gdbctx *ctx, uint64_t ip) {
   return cnt;
 }
 
-size_t insn_counter;
 int process_block(struct pt_block *block,
                   struct pt_image_section_cache *iscache, uint64_t *fip,
                   gdbctx *ctx) {
@@ -70,14 +72,28 @@ int process_block(struct pt_block *block,
     uint64_t address = ip;
     size_t sz = 0x10; // max size of x86 insn is 15 bytes
     if (!cs_disasm_iter(handle, &code, &sz, &address, tinsn)) {
-      GDB_PRINTF("cs_disasm_iter: %s\n", cs_strerror(cs_errno(handle)));
+      GDB_PRINTF("0x%.16lx[%c]:\t", ip, insn.speculative ? '?' : 'x');
+      // for (int i = 0; i < sz; ++i)
+      //   printf("%.2x ", *(uint8_t *)(ip + i));
+      // printf("\n");
+      for (int i = 0; i < 0x10; ++i) {
+        if (insn_hit_count_get(ctx, ip - i) == 0)
+          continue;
+        code = (uint8_t *)(ip - i);
+        address = ip - i;
+        if (cs_disasm_iter(handle, &code, &sz, &address, tinsn)) {
+          GDB_PRINTF("0x%.16lx[%d]:\t%s\n", tinsn->address, tinsn->size,
+                     tinsn->mnemonic, tinsn->op_str);
+        }
+      }
+      // GDB_PRINTF("cs_disasm_iter: %s\n", cs_strerror(cs_errno(handle)));
       break;
     }
     // GDB_PRINTF("0x%.16lx[%c]:\t%s\t%s\n", insn.ip, insn.speculative ? '?' :
     // 'x',
     //            tinsn->mnemonic, tinsn->op_str);
     ip += tinsn->size;
-    insn_counter++;
+    ctx->instruction_count++;
   }
 
   *fip = ip;
@@ -143,14 +159,20 @@ int pt_process_trace(uint8_t *buf, size_t n, gdbctx *ctx) {
       if (wstatus < 0)
         break;
     }
+
+    // TODO: Handle error
     if (wstatus == -pte_eos)
       break;
     if (wstatus < 0)
       break;
   }
 
-  // GDB_PRINTF("Final ip from decode: 0x%.16lx\n", fip);
-  // GDB_PRINTF("Finished processing %d instructions.\n", insn_counter);
+  GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d\n", fip, wstatus);
+
+  struct user_regs_struct xregs = {0};
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+  GDB_PRINTF("RIP: 0x%.16lx\n", xregs.rip);
+  GDB_PRINTF("Total instructions: %d.\n", ctx->instruction_count);
 
   pt_blk_free_decoder(decoder);
 
@@ -189,7 +211,7 @@ int pt_init(gdbctx *ctx) {
   // overfill our aux buffer, otherwise we'll stop dropping samples
 
   // data size, aux size
-  int n = 0, m = 16;
+  int n = 0, m = AUX_SIZE;
 
   ctx->base =
       mmap(NULL, (1 + 2 * n) * PAGE_SIZE, PROT_WRITE, MAP_SHARED, ctx->pfd, 0);
@@ -220,7 +242,7 @@ int pt_init(gdbctx *ctx) {
 }
 
 // TODO: Match with aux size in pt_init
-uint8_t ptbuf[2 * 16 * PAGE_SIZE];
+uint8_t ptbuf[2 * AUX_SIZE * PAGE_SIZE];
 void pt_update_sketch(gdbctx *ctx) {
   size_t trace_sz = 0;
 
@@ -247,29 +269,33 @@ void pt_update_sketch(gdbctx *ctx) {
     trace_sz += sizeof(PT_PROLOGUE);
   }
 
-// #ifdef PT_DEBUG
+#ifdef PT_DEBUG
   GDB_PRINTF("Read from %p to %p\n", ctx->header->aux_tail,
              ctx->header->aux_head);
-// #endif
+  // GDB_PRINTF("", 0);
+  // for (size_t i = 0; i < trace_sz; ++i)
+  //   printf("%.2x ", ptbuf[i]);
+  // printf("\n");
+#endif
 
   pt_process_trace(ptbuf, trace_sz, ctx);
 
-#ifdef PT_DEBUG
-  uint64_t ip = 0x00555555554000 + 0x1227;
-  while (ip < 0x00555555554000 + 0x45be + 0x5) {
-    const uint8_t *code = (uint8_t *)ip;
-    uint64_t address = ip;
-    // max size of x86 insn is 15 bytes
-    size_t sz = 0x10;
-    if (!cs_disasm_iter(handle, &code, &sz, &address, tinsn)) {
-      GDB_PRINTF("cs_disasm_iter: %s\n", cs_strerror(cs_errno(handle)));
-      break;
-    }
-    GDB_PRINTF("0x%.16lx[%d]:\t%s\t%s\n", ip, insn_hit_count_get(ctx, ip),
-               tinsn->mnemonic, tinsn->op_str);
-    ip += tinsn->size;
-  }
-#endif
+  // #ifdef PT_DEBUG
+  //   uint64_t ip = 0x00555555554000 + 0x1227;
+  //   while (ip < 0x00555555554000 + 0x45be + 0x5) {
+  //     const uint8_t *code = (uint8_t *)ip;
+  //     uint64_t address = ip;
+  //     // max size of x86 insn is 15 bytes
+  //     size_t sz = 0x10;
+  //     if (!cs_disasm_iter(handle, &code, &sz, &address, tinsn)) {
+  //       GDB_PRINTF("cs_disasm_iter: %s\n", cs_strerror(cs_errno(handle)));
+  //       break;
+  //     }
+  //     GDB_PRINTF("0x%.16lx[%d]:\t%s\t%s\n", ip, insn_hit_count_get(ctx, ip),
+  //                tinsn->mnemonic, tinsn->op_str);
+  //     ip += tinsn->size;
+  //   }
+  // #endif
 
   ctx->header->aux_tail = ctx->header->aux_head;
 }

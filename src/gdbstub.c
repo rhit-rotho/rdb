@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/ptrace.h>
+#include <sys/timerfd.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 
@@ -26,17 +27,59 @@ void gdb_pause(gdbctx *ctx) {
   int status;
   xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
-  if (ioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0) < 0)
-    xperror("ioctl(PERF_EVENT_IOC_DISABLE)");
+  xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
   pt_update_sketch(ctx);
+  gdb_disarm_timer(ctx);
+
+  for (size_t i = 0; i < ctx->bps_sz; ++i)
+    breakpoint_del(ctx, &ctx->bps[i]);
+
   ctx->stopped = 1;
 }
 
+void gdb_disarm_timer(gdbctx *ctx) {
+  struct itimerspec arm = {0};
+  if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
+    xperror("timerfd_settime");
+}
+
+void gdb_arm_timer(gdbctx *ctx) {
+  struct itimerspec arm = {0};
+  // arm.it_interval.tv_sec = 10;
+  // arm.it_interval.tv_nsec = 0;
+  arm.it_interval.tv_sec = 0;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 10;
+  arm.it_value.tv_nsec = 0;
+  arm.it_value.tv_nsec = 1000 * 1000 * 10;
+  if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
+    xperror("timerfd_settime");
+}
+
+// TODO: This doesn't work when two breakpoints are in one word.
+void breakpoint_add(gdbctx *ctx, Breakpoint *bp) {
+  GDB_PRINTF("%s: breakpoint @ %p\n", __FUNCTION__, bp->ip);
+
+  uint8_t data[4];
+  uintptr_t addr = bp->ip;
+  memcpy(data, addr & ~0x3, 4);
+  memcpy(&ctx->bps[ctx->bps_sz].patch, data, 4);
+  data[(uintptr_t)addr & 0x3] = 0xcc;
+  xptrace(PTRACE_POKEDATA, ctx->ppid, addr & ~0x3, *(uint32_t *)data);
+  assert(*(uint8_t *)addr == 0xcc);
+}
+
+void breakpoint_del(gdbctx *ctx, Breakpoint *bp) {
+  GDB_PRINTF("%s: breakpoint @ %p\n", __FUNCTION__, bp->ip);
+  xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~0x3, bp->patch);
+}
+
 void gdb_continue(gdbctx *ctx) {
-  if (ioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0) < 0)
-    xperror("ioctl(PERF_EVENT_IOC_ENABLE)");
-  xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+  gdb_arm_timer(ctx); // Re-arm timer
+  xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
+  for (size_t i = 0; i < ctx->bps_sz; ++i)
+    breakpoint_add(ctx, &ctx->bps[i]);
   ctx->stopped = 0;
+  xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
 }
 
 void gdb_save_state(gdbctx *ctx) {
@@ -95,7 +138,19 @@ void gdb_send_packet_bytes(gdbctx *ctx, char *data, size_t n) {
 }
 
 void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
-  char *endptr = buf + n;
+
+  if (n == 0)
+    return;
+
+  while (*buf == '+') {
+    buf += 1;
+    n -= 1;
+  }
+
+  // TODO: This should be a proper ack, not just whenever we think it'll pacify
+  // GDB
+  write(ctx->fd, "+", 1);
+
   if (*buf == '\x03') {
     if (!ctx->stopped)
       gdb_pause(ctx);
@@ -106,23 +161,14 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     buf += 1;
     n -= 1;
   }
-
-  if (buf == endptr)
+  if (n == 0)
     return;
-
-  while (*buf == '+')
-    buf += 1;
-
-  if (buf == endptr)
-    return;
-
-  // TODO: This should be a proper ack, not just whenever we think it'll pacify
-  // GDB
-  write(ctx->fd, "+", 1);
 
   assert(*buf == '$');
-  if (*buf == '$')
-    buf++;
+  if (*buf == '$') {
+    buf += 1;
+    n -= 1;
+  }
 
   char c = buf[0];
   buf++;
@@ -184,16 +230,48 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 
     // gdb_save_state(ctx);
 
-    for (size_t i = 0; i < ctx->bps_sz; ++i) {
-      GDB_PRINTF("Hit %p %d times since the last checkpoint\n", ctx->bps[i].ip,
-                 insn_hit_count_get(ctx, ctx->bps[i].ip));
-    }
+    // TODO: This mechanic only works if we call reverse-continue once, we need
+    // a way to describe "already in introspection" states.
 
-    GDB_PRINTF("Checking out to %.16lx\n", pbvt_head()->parent->current->hash);
-    pbvt_checkout(pbvt_head()->parent);
+    Commit *c = pbvt_head();
+    Breakpoint *bp = NULL;
+    while (c && !bp) {
+      GDB_PRINTF("Checking out to %.16lx\n", c->hash);
+      pbvt_checkout(c);
+      for (size_t i = 0; i < ctx->bps_sz; ++i) {
+        GDB_PRINTF("Hit %p ", ctx->bps[i].ip);
+        printf("%d times since the last checkpoint\n",
+               insn_hit_count_get(ctx, ctx->bps[i].ip));
+        GDB_PRINTF("%s\n", __FUNCTION__);
+        if (insn_hit_count_get(ctx, ctx->bps[i].ip) > 0) {
+          GDB_PRINTF("%s\n", __FUNCTION__);
+          bp = &ctx->bps[i];
+          GDB_PRINTF("%s\n", __FUNCTION__);
+          break;
+        }
+      }
+      c = c->parent;
+    }
 
     xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
     xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+    // TODO: There may have been multiple breakpoints hit since the last
+    // snapshot, we need the last one.
+
+    // TODO: Inject signals/syscalls/etc. when rewinding.
+
+    if (bp) {
+      GDB_PRINTF("Found breakpoint!\n", 0);
+      breakpoint_add(ctx, bp);
+
+      int status;
+      for (size_t i = 0; i < insn_hit_count_get(ctx, bp->ip); ++i) {
+        xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+        waitpid(ctx->ppid, &status, 0);
+      }
+    }
+
     gdb_send_packet(ctx, "S05"); // sigtrap x86
     break;
   }
@@ -217,6 +295,7 @@ void gdb_handle_c_commands(gdbctx *ctx, char *buf, size_t n) {
   UNUSED(n);
 
   gdb_save_state(ctx);
+  GDB_PRINTF("Continuing...\n", 0);
   gdb_continue(ctx);
   // gdb_send_packet(ctx, "S12"); // sigcont x86
   gdb_send_packet(ctx, "OK");
@@ -714,13 +793,7 @@ void gdb_handle_z_add_commands(gdbctx *ctx, char *buf, size_t n) {
 
   ctx->bps[ctx->bps_sz].ip = addr;
   GDB_PRINTF("Write trap to %p\n", addr);
-  uint8_t data[4];
-  memcpy(data, (uintptr_t)addr & ~0x3, 4);
-  memcpy(&ctx->bps[ctx->bps_sz].patch, data, 4);
-  data[(uintptr_t)addr & 0x3] = 0xcc;
-  xptrace(PTRACE_POKEDATA, ctx->ppid, (uintptr_t)addr & ~0x3,
-          *(uint32_t *)data);
-  assert(*(uint8_t *)addr == 0xcc);
+  breakpoint_add(ctx, &ctx->bps[ctx->bps_sz]);
   ctx->bps_sz += 1;
   return gdb_send_packet(ctx, "OK");
 }
@@ -739,24 +812,23 @@ void gdb_handle_z_del_commands(gdbctx *ctx, char *buf, size_t n) {
 
   Breakpoint *bp = NULL;
   size_t pos = 0;
-  // for (size_t i = 0; i < ctx->bps_sz; ++i) {
-  //   if (ctx->bps[i].ip == addr) {
-  //     bp = &ctx->bps[i];
-  //     xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~0x3, bp->patch);
-  //     pos = i;
-  //     break;
-  //   }
-  // }
+  for (size_t i = 0; i < ctx->bps_sz; ++i) {
+    if (ctx->bps[i].ip == addr) {
+      bp = &ctx->bps[i];
+      pos = i;
+      break;
+    }
+  }
 
   // TODO: Send correct error
   if (!bp) {
     gdb_send_packet(ctx, "E5");
-    return;
+    // return gdb_send_packet(ctx, "OK");
   }
 
-  // for (size_t i = pos; i < ctx->bps_sz - 1; ++i)
-  //   ctx->bps[i] = ctx->bps[i + 1];
-  // ctx->bps_sz -= 1;
+  for (size_t i = pos; i < ctx->bps_sz - 1; ++i)
+    ctx->bps[i] = ctx->bps[i + 1];
+  ctx->bps_sz -= 1;
 
   return gdb_send_packet(ctx, "OK");
 }

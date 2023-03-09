@@ -15,7 +15,6 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
-#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/user.h>
@@ -25,8 +24,6 @@
 #include "gdbstub.h"
 #include "pbvt.h"
 #include "pt.h"
-
-// #define PT_DEBUG
 
 // TODO: Grab binary when first injecting into process
 #define APP_NAME "test-app"
@@ -232,41 +229,20 @@ int gdbstub(void *args) {
 
   GDB_PRINTF("done.\n", 0);
 
-  int timerfd = timerfd_create(CLOCK_REALTIME, 0);
-  struct itimerspec arm = {0};
-  // arm.it_interval.tv_sec = 10;
-  // arm.it_interval.tv_nsec = 0;
-  arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 10;
-  arm.it_value.tv_nsec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 10;
-  if (timerfd_settime(timerfd, 0, &arm, NULL) < 0)
-    xperror("timerfd_settime");
+  ctx->timerfd = timerfd_create(CLOCK_REALTIME, 0);
+  gdb_arm_timer(ctx);
 
-  sigset_t mask = {0};
-  sigemptyset(&mask);
-  sigaddset(&mask, SIGCHLD);
-  sigprocmask(SIG_BLOCK, &mask, NULL);
-  int sfd = signalfd(-1, &mask, 0);
-  if (sfd < 0)
-    xperror("signalfd");
-
-  // TODO: Add signalfd for handling segfaults, syscalls, and signals
   struct pollfd pollfds[3] = {0};
   pollfds[0].fd = cfd;
   pollfds[0].events = POLLIN | POLLERR;
-  pollfds[1].fd = sfd;
+  pollfds[1].fd = ctx->timerfd;
   pollfds[1].events = POLLIN | POLLERR;
-  pollfds[2].fd = timerfd;
-  pollfds[2].events = POLLIN | POLLERR;
 
   char gdb_buf[0x100];
 
-  size_t snap_counter = 0;
-
   // Main event loop
   for (;;) {
-    if (poll(pollfds, 3, -1) < 0)
+    if (poll(pollfds, 2, -1) < 0)
       xperror("poll(wrapper)");
 
     // Socket
@@ -286,23 +262,12 @@ int gdbstub(void *args) {
 
     // Process hit syscall, handle this before our timer in case the process
     // is already stopped on a syscall.
-    if (pollfds[1].revents & POLLERR)
-      xperror("POLLERR in signalfd");
-    if (pollfds[1].revents & POLLIN) {
+    if (waitpid(ctx->ppid, &status, WNOHANG) > 0) {
       GDB_PRINTF("Handle signal\n", 0);
-      struct signalfd_siginfo ssi;
-      read(pollfds[1].fd, &ssi, sizeof(ssi));
 
       // Stopped by GDB
-      if (ctx->stopped)
-        continue;
-
-      GDB_PRINTF("ssi.ssi_signo: %d ssi.ssi_code: %d\n", ssi.ssi_signo,
-                 ssi.ssi_code);
-
-      // ptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
-      waitpid(ctx->ppid, &status, 0);
-      ctx->stopped = 1;
+      // if (ctx->stopped)
+      //   continue;
       gdb_save_state(ctx);
 
       GDB_PRINTF("Status: %d, sig: %d\n", status, WSTOPSIG(status),
@@ -310,7 +275,7 @@ int gdbstub(void *args) {
 
       if (WSTOPSIG(status) == SIGTRAP) {
         Breakpoint *bp = NULL;
-        for (int i = 0; i < ctx->bps_sz; ++i) {
+        for (size_t i = 0; i < ctx->bps_sz; ++i) {
           if (ctx->regs->rip - 1 == ctx->bps[i].ip) {
             bp = &ctx->bps[i];
             break;
@@ -322,8 +287,9 @@ int gdbstub(void *args) {
                      ctx->regs->rip - 1, bp->ip);
           ctx->regs->rip -= 1;
           xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
-          xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~0x3, bp->patch);
+          breakpoint_del(ctx,bp);
           gdb_send_packet(ctx, "S05");
+          ctx->stopped = 1;
           continue;
         }
       } else if (WSTOPSIG(status) == SIGSEGV) {
@@ -342,29 +308,25 @@ int gdbstub(void *args) {
 
       gdb_continue(ctx);
 
-      // snap_counter += 1;
-      // if (snap_counter % 100 == 0)
-      //   pbvt_stats();
       continue;
     }
 
     // Timer
-    if (pollfds[2].revents & POLLERR)
+    if (pollfds[1].revents & POLLERR)
       xperror("POLLERR in timer");
-    if (pollfds[2].revents & POLLIN) {
+    if (pollfds[1].revents & POLLIN) {
       uint64_t expiry;
-      read(pollfds[2].fd, &expiry, sizeof(expiry));
+      read(pollfds[1].fd, &expiry, sizeof(expiry));
 
       if (ctx->stopped)
         continue;
+
+      GDB_PRINTF("Snapshot because of timeout\n", 0);
 
       gdb_pause(ctx);
       gdb_save_state(ctx);
       gdb_continue(ctx);
 
-      // snap_counter += 1;
-      // if (snap_counter % 100 == 0)
-      //   pbvt_stats();
       continue;
     }
 

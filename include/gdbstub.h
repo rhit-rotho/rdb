@@ -25,8 +25,18 @@
   } while (0)
 #endif
 
+#define xioctl(fildes, request, arg)                                           \
+  do {                                                                         \
+    GDB_PRINTF("xioctl(%s)\n", #request);                                      \
+    if (ioctl(fildes, request, arg) == -1) {                                   \
+      GDB_PRINTF("%s: %s\n", #request, strerror(errno));                       \
+      exit(-1);                                                                \
+    }                                                                          \
+  } while (0)
+
 #define xptrace(req, pid, addr, data)                                          \
   do {                                                                         \
+    GDB_PRINTF("xptrace(%s)\n", #req);                                         \
     if (ptrace(req, pid, addr, data) == -1) {                                  \
       GDB_PRINTF("%s: %s\n", #req, strerror(errno));                           \
       exit(-1);                                                                \
@@ -51,6 +61,8 @@ typedef struct gdbctx {
   volatile struct user_fpregs_struct *fpregs;
   int stopped;
 
+  int timerfd;
+
   uint64_t *sketch[SKETCH_COL];
   uint64_t sketch_sz;
 
@@ -61,11 +73,17 @@ typedef struct gdbctx {
   struct pt_image_section_cache *pim;
   int asid;
 
-  Breakpoint bps[0x10];
+  Breakpoint bps[0x20];
   size_t bps_sz;
+  size_t instruction_count;
 } gdbctx;
 
+void breakpoint_add(gdbctx *ctx, Breakpoint *bp);
+void breakpoint_del(gdbctx *ctx, Breakpoint *bp);
+
 uint8_t gdb_checksum(char *c, size_t n);
+void gdb_arm_timer(gdbctx *ctx);
+void gdb_disarm_timer(gdbctx *ctx);
 
 void gdb_save_state(gdbctx *ctx);
 void gdb_pause(gdbctx *ctx);

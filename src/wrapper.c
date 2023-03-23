@@ -96,10 +96,10 @@ int gdbstub(void *args) {
     xperror("fopen");
 
   struct pt_image_section_cache *pim = pt_iscache_alloc(NULL);
-  int asid;
+  int asid = 0xbad;
 
   char buf[PROCMAPS_LINE_MAX_LENGTH];
-  uint64_t image_start;
+  uint64_t image_start = 0;
   while (read_line(maps, buf, PROCMAPS_LINE_MAX_LENGTH)) {
     char flags[5] = {0};
     char name[PATH_MAX] = {0};
@@ -167,15 +167,13 @@ int gdbstub(void *args) {
 
   GDB_PRINTF("Done tracking memory...\n", 0);
 
-  pbvt_commit();
-  pbvt_branch_commit("main");
-
   // Initialize gdbctx
   gdbctx gctx = {0};
   gdbctx *ctx = &gctx;
 
   ctx->ppid = ppid;
   ctx->stopped = 1;
+  ctx->instruction_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
   ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
 
@@ -185,14 +183,18 @@ int gdbstub(void *args) {
   for (int i = 0; i < SKETCH_COL; ++i)
     ctx->sketch[i] = &alloc[i * ctx->sketch_sz];
 
-  gdb_save_state(ctx);
-
   xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
   GDB_PRINTF("status: %d\n", status);
   ctx->regs->rax = 0;
+  ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
   GDB_PRINTF("rip: %p\n", ctx->regs->rip);
+
+  gdb_save_state(ctx);
+  pbvt_branch_commit("head");
+  pbvt_branch_commit("main");
 
   pt_init(ctx);
   ctx->pim = pim;
@@ -227,7 +229,7 @@ int gdbstub(void *args) {
     xperror("accept");
   ctx->fd = cfd;
 
-  GDB_PRINTF("done.\n", 0);
+  printf("done.\n");
 
   ctx->timerfd = timerfd_create(CLOCK_REALTIME, 0);
   gdb_arm_timer(ctx);
@@ -255,7 +257,7 @@ int gdbstub(void *args) {
       if (nbytes == 0)
         break;
       gdb_buf[nbytes] = '\0';
-      GDB_PRINTF("Remote: \"%s\", n: %d\n", gdb_buf, nbytes);
+      // GDB_PRINTF("Remote: \"%s\", n: %d\n", gdb_buf, nbytes);
       gdb_handle_packet(ctx, gdb_buf, nbytes);
       continue;
     }
@@ -270,8 +272,18 @@ int gdbstub(void *args) {
       //   continue;
       gdb_save_state(ctx);
 
-      GDB_PRINTF("Status: %d, sig: %d\n", status, WSTOPSIG(status),
+      GDB_PRINTF("Status: %d, sig: %d stopped? %d\n", status, WSTOPSIG(status),
                  WIFSTOPPED(status));
+
+      siginfo_t si;
+      xptrace(PTRACE_GETSIGINFO, ctx->ppid, 0, &si);
+      GDB_PRINTF("%d %d %d\n", si.si_code, si.si_errno, si.si_signo);
+
+      // ?
+      if (WSTOPSIG(status) == SIGWINCH) {
+        xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+        continue;
+      }
 
       if (WSTOPSIG(status) == SIGTRAP) {
         Breakpoint *bp = NULL;
@@ -285,15 +297,24 @@ int gdbstub(void *args) {
         if (bp) {
           GDB_PRINTF("Hit breakpoint! RIP: %.16lx BP: %.16lx\n",
                      ctx->regs->rip - 1, bp->ip);
+          ctx->regs->rax = 0;
+          xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
           ctx->regs->rip -= 1;
+          breakpoint_del(ctx, bp);
           xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
-          breakpoint_del(ctx,bp);
+
           gdb_send_packet(ctx, "S05");
           ctx->stopped = 1;
           continue;
         }
       } else if (WSTOPSIG(status) == SIGSEGV) {
-        abort();
+        gdb_send_packet(ctx, "S0b");
+        ctx->stopped = 1;
+        continue;
+      } else if (WSTOPSIG(status) == SIGILL) {
+        gdb_send_packet(ctx, "S04");
+        ctx->stopped = 1;
+        continue;
       }
 
       GDB_PRINTF("Entering syscall:\trax: %.16lx rdi: %.16lx rsi: "

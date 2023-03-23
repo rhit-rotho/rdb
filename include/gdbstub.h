@@ -27,7 +27,6 @@
 
 #define xioctl(fildes, request, arg)                                           \
   do {                                                                         \
-    GDB_PRINTF("xioctl(%s)\n", #request);                                      \
     if (ioctl(fildes, request, arg) == -1) {                                   \
       GDB_PRINTF("%s: %s\n", #request, strerror(errno));                       \
       exit(-1);                                                                \
@@ -36,7 +35,6 @@
 
 #define xptrace(req, pid, addr, data)                                          \
   do {                                                                         \
-    GDB_PRINTF("xptrace(%s)\n", #req);                                         \
     if (ptrace(req, pid, addr, data) == -1) {                                  \
       GDB_PRINTF("%s: %s\n", #req, strerror(errno));                           \
       exit(-1);                                                                \
@@ -51,7 +49,7 @@
 
 typedef struct Breakpoint {
   uintptr_t ip;
-  uint32_t patch;
+  uint64_t patch;
 } Breakpoint;
 
 typedef struct gdbctx {
@@ -65,6 +63,7 @@ typedef struct gdbctx {
 
   uint64_t *sketch[SKETCH_COL];
   uint64_t sketch_sz;
+  size_t *instruction_count;
 
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;
@@ -75,7 +74,6 @@ typedef struct gdbctx {
 
   Breakpoint bps[0x20];
   size_t bps_sz;
-  size_t instruction_count;
 } gdbctx;
 
 void breakpoint_add(gdbctx *ctx, Breakpoint *bp);

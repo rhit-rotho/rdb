@@ -55,22 +55,29 @@ void gdb_arm_timer(gdbctx *ctx) {
     xperror("timerfd_settime");
 }
 
+#define WORD_SIZE (sizeof(void *))
+#define WORD_MASK (WORD_SIZE - 1)
+
 // TODO: This doesn't work when two breakpoints are in one word.
 void breakpoint_add(gdbctx *ctx, Breakpoint *bp) {
   GDB_PRINTF("%s: breakpoint @ %p\n", __FUNCTION__, bp->ip);
 
-  uint8_t data[4];
+  uint8_t data[WORD_SIZE];
   uintptr_t addr = bp->ip;
-  memcpy(data, addr & ~0x3, 4);
-  memcpy(&ctx->bps[ctx->bps_sz].patch, data, 4);
-  data[(uintptr_t)addr & 0x3] = 0xcc;
-  xptrace(PTRACE_POKEDATA, ctx->ppid, addr & ~0x3, *(uint32_t *)data);
+  memcpy(data, (void *)(addr & ~WORD_MASK), WORD_SIZE);
+  memcpy(&ctx->bps[ctx->bps_sz].patch, data, WORD_SIZE);
+
+  data[(uintptr_t)addr & WORD_MASK] = 0xcc;
+  xptrace(PTRACE_POKEDATA, ctx->ppid, addr & ~WORD_MASK, *(uint64_t *)data);
   assert(*(uint8_t *)addr == 0xcc);
 }
 
 void breakpoint_del(gdbctx *ctx, Breakpoint *bp) {
   GDB_PRINTF("%s: breakpoint @ %p\n", __FUNCTION__, bp->ip);
-  xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~0x3, bp->patch);
+
+  uint8_t *data = (uint8_t *)&bp->patch;
+  xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~WORD_MASK, bp->patch);
+  assert(*(uint8_t *)bp->ip == data[bp->ip & WORD_MASK]);
 }
 
 void gdb_continue(gdbctx *ctx) {
@@ -110,7 +117,6 @@ void gdb_send_packet(gdbctx *ctx, char *data) {
   write(ctx->fd, reply, nbytes);
 }
 
-// TODO: Escape packet bytes
 void gdb_send_packet_bytes(gdbctx *ctx, char *data, size_t n) {
   uint8_t c = 0;
   size_t t = 0;
@@ -235,22 +241,28 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 
     Commit *c = pbvt_head();
     Breakpoint *bp = NULL;
-    while (c && !bp) {
-      GDB_PRINTF("Checking out to %.16lx\n", c->hash);
+    while (c && c != pbvt_branch_head("head") && !bp) {
+      GDB_PRINTF("Checking out to %.16lx (skipped %ld instructions)\n", c->hash,
+                 *ctx->instruction_count);
       pbvt_checkout(c);
       for (size_t i = 0; i < ctx->bps_sz; ++i) {
-        GDB_PRINTF("Hit %p ", ctx->bps[i].ip);
-        printf("%d times since the last checkpoint\n",
-               insn_hit_count_get(ctx, ctx->bps[i].ip));
-        GDB_PRINTF("%s\n", __FUNCTION__);
+        GDB_PRINTF("Hit 0x%.16lx %d times since the last checkpoint\n",
+                   ctx->bps[i].ip, insn_hit_count_get(ctx, ctx->bps[i].ip));
         if (insn_hit_count_get(ctx, ctx->bps[i].ip) > 0) {
-          GDB_PRINTF("%s\n", __FUNCTION__);
           bp = &ctx->bps[i];
-          GDB_PRINTF("%s\n", __FUNCTION__);
           break;
         }
       }
       c = c->parent;
+    }
+
+    if (c == pbvt_branch_head("head")) {
+      GDB_PRINTF("Rewound to head! IP: 0x%.16lx\n", ctx->regs->rip);
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+      xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+      ctx->stopped = 1;
+      gdb_send_packet(ctx, "S05"); // sigtrap x86
+      break;
     }
 
     xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
@@ -262,14 +274,39 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     // TODO: Inject signals/syscalls/etc. when rewinding.
 
     if (bp) {
-      GDB_PRINTF("Found breakpoint!\n", 0);
+      // Grab this before we checkout so we don't get the hit counts for the
+      // *previous* snapshot.
+      size_t hit_cnt = insn_hit_count_get(ctx, bp->ip);
+      pbvt_checkout(c->parent);
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+      xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+      GDB_PRINTF("Found breakpoint, rewinding starting at %.16lx!\n",
+                 ctx->regs->rip);
       breakpoint_add(ctx, bp);
 
       int status;
-      for (size_t i = 0; i < insn_hit_count_get(ctx, bp->ip); ++i) {
+      ctx->regs->rax = 0;
+      for (size_t i = 0; i < hit_cnt - 1; ++i) {
         xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
         waitpid(ctx->ppid, &status, 0);
+        xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+        breakpoint_del(ctx, bp);
+        ctx->regs->rip -= 1;
+        xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+        xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+        waitpid(ctx->ppid, &status, 0);
+        breakpoint_add(ctx, bp);
       }
+
+      // Remove breakpoint
+      xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+      breakpoint_del(ctx, bp);
+      ctx->regs->rip -= 1;
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+      ctx->stopped = 1;
     }
 
     gdb_send_packet(ctx, "S05"); // sigtrap x86
@@ -554,7 +591,7 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
   if (starts_with(buf, "Supported")) {
     gdb_send_packet(ctx, "PacketSize=47ff;ReverseStep+;ReverseContinue+;qXfer:"
                          "exec-file:read+;qXfer:features:read+;qXfer:libraries-"
-                         "svr4:read+;qXfer:auxv:read+;swbreak+");
+                         "svr4:read+;qXfer:auxv:read+;swbreak+;multiprocess+");
   } else if (starts_with(buf, "TStatus")) {
     gdb_send_empty(ctx);
   } else if (starts_with(buf, "Offsets")) {
@@ -629,7 +666,9 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
   } else if (starts_with(buf, "Xfer:exec-file:read:")) {
     buf += strlen("Xfer:exec-file:read:");
 
-    // size_t annex = 0;
+    size_t annex = strtoull(buf, &endptr, 0x10);
+    buf = endptr;
+    assert(*buf == ':');
     buf += 1;
     uintptr_t offset = strtoull(buf, &endptr, 0x10);
     buf = endptr;
@@ -637,7 +676,9 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
     buf += 1;
     uintptr_t length = strtoull(buf, &endptr, 0x10);
 
-    GDB_PRINTF("PARTIAL read-file: %d %d\n", offset, length);
+    UNUSED(annex);
+
+    GDB_PRINTF("PARTIAL: read-file: %d %d\n", offset, length);
 
     size_t nbytes = 0;
     if (nbytes == 0) {
@@ -662,7 +703,12 @@ void gdb_handle_s_commands(gdbctx *ctx, char *buf, size_t n) {
     gdb_pause(ctx);
   xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
-  gdb_send_packet(ctx, "S05");
+
+  GDB_PRINTF("Single-step: %d %d\n", status, WSTOPSIG(status));
+
+  char tmp[0x20];
+  snprintf(tmp, sizeof(tmp), "S%.2x", WSTOPSIG(status));
+  gdb_send_packet(ctx, tmp);
 }
 
 void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
@@ -761,7 +807,7 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
       gdb_send_empty(ctx);
     }
   } else if (starts_with(buf, "Cont?")) {
-    gdb_send_packet(ctx, "vCont;c;s");
+    gdb_send_packet(ctx, "vCont;c;C;s;S");
   } else if (starts_with(buf, "Cont")) {
     GDB_PRINTF("Assuming continue... %d\n", ctx->ppid);
 
@@ -777,13 +823,18 @@ void gdb_handle_z_add_commands(gdbctx *ctx, char *buf, size_t n) {
   char *endptr;
   size_t type = strtoull(buf, &endptr, 0x10);
   buf = endptr + 1;
-  void *addr = (void *)strtoull(buf, &endptr, 0x10);
+  uint64_t addr = strtoull(buf, &endptr, 0x10);
   buf = endptr + 1;
   size_t kind = strtoull(buf, &endptr, 0x10);
   buf = endptr;
 
   UNUSED(type);
   UNUSED(kind);
+  UNUSED(n);
+
+  for (size_t i = 0; i < ctx->bps_sz; ++i)
+    if (ctx->bps[i].ip == addr)
+      return gdb_send_packet(ctx, "OK");
 
   // TODO: Make bps resiable, send correct error code
   if (ctx->bps_sz + 1 >= sizeof(ctx->bps) / sizeof(ctx->bps[0])) {
@@ -791,7 +842,7 @@ void gdb_handle_z_add_commands(gdbctx *ctx, char *buf, size_t n) {
     return;
   }
 
-  ctx->bps[ctx->bps_sz].ip = addr;
+  ctx->bps[ctx->bps_sz].ip = (uintptr_t)addr;
   GDB_PRINTF("Write trap to %p\n", addr);
   breakpoint_add(ctx, &ctx->bps[ctx->bps_sz]);
   ctx->bps_sz += 1;
@@ -802,13 +853,14 @@ void gdb_handle_z_del_commands(gdbctx *ctx, char *buf, size_t n) {
   char *endptr;
   size_t type = strtoull(buf, &endptr, 0x10);
   buf = endptr + 1;
-  void *addr = (void *)strtoull(buf, &endptr, 0x10);
+  uintptr_t addr = strtoull(buf, &endptr, 0x10);
   buf = endptr + 1;
   size_t kind = strtoull(buf, &endptr, 0x10);
   buf = endptr;
 
   UNUSED(type);
   UNUSED(kind);
+  UNUSED(n);
 
   Breakpoint *bp = NULL;
   size_t pos = 0;
@@ -821,11 +873,10 @@ void gdb_handle_z_del_commands(gdbctx *ctx, char *buf, size_t n) {
   }
 
   // TODO: Send correct error
-  if (!bp) {
-    gdb_send_packet(ctx, "E5");
-    // return gdb_send_packet(ctx, "OK");
-  }
+  if (!bp)
+    return gdb_send_packet(ctx, "OK");
 
+  breakpoint_del(ctx, bp);
   for (size_t i = pos; i < ctx->bps_sz - 1; ++i)
     ctx->bps[i] = ctx->bps[i + 1];
   ctx->bps_sz -= 1;

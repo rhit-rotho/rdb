@@ -13,8 +13,9 @@
 #include <time.h>
 
 #include "fasthash.h"
-#include "hashtable.h"
+#include "mmap_malloc.h"
 #include "pt.h"
+#include "rdb_hashtable.h"
 
 // #define PT_DEBUG
 #define AUX_SIZE (512)
@@ -26,8 +27,8 @@ const uint8_t PT_PROLOGUE[] = {0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
 
 csh handle;
 cs_insn *tinsn;
-HashTable *bb_cache;
-HashTable *bb_insn;
+RHashTable *bb_cache;
+RHashTable *bb_insn;
 
 __attribute__((hot)) inline void hit_count_inc(Sketch *sketch, uint64_t ip) {
   for (int i = 0; i < SKETCH_COL; ++i)
@@ -46,13 +47,6 @@ __attribute__((hot)) inline uint64_t hit_count_get(Sketch *sketch,
   return cnt;
 }
 
-typedef struct CacheEntry {
-  Sketch sketch;
-  uint64_t sip;
-  uint64_t fip;
-  uint64_t cnt_idx[SKETCH_COL];
-} CacheEntry;
-
 uint64_t get_jump_target(cs_insn *insn) {
   for (int i = 0; i < insn->detail->x86.op_count; i++) {
     if (insn->detail->x86.operands[i].type == X86_OP_IMM) {
@@ -65,18 +59,16 @@ uint64_t get_jump_target(cs_insn *insn) {
 // TODO: We need to convert between what Intel PT considers "blocks"
 // (instruction flow that can be recovered without any conditionals) to "basic
 // blocks" (straight line sequence that doesn't contain any intra-block jumps).
-int process_block(gdbctx *ctx, WriteBuffer *wb, struct pt_block *block,
-                  uint64_t *fip) {
+int process_block(gdbctx *ctx, struct pt_block *block, uint64_t *fip) {
   uint16_t ninsn;
   uint64_t ip;
 
-  CacheEntry *et = (CacheEntry *)ht_get(bb_cache, block->ip);
+  CacheEntry *et = (CacheEntry *)rht_get(bb_cache, block->ip);
   if (et) {
+    (*ctx->bb_count)++;
     *fip = et->fip;
     *ctx->insn_count += block->ninsn;
-    (*ctx->bb_count)++;
-    for (int i = 0; i < SKETCH_COL; ++i)
-      wb->writes[i][wb->sz[i]++] = et->cnt_idx[i];
+    hit_count_inc(&ctx->sketch, block->ip);
     return 0;
   }
 
@@ -109,8 +101,8 @@ int process_block(gdbctx *ctx, WriteBuffer *wb, struct pt_block *block,
 
     // HACK: This doesn't fully tell us which instruction corresponds to
     // which basic blocks unfortunately :(
-    if (!ht_get(bb_insn, ip))
-      ht_insert(bb_insn, ip, (void *)block->ip);
+    if (!rht_get(bb_insn, ip))
+      rht_insert(bb_insn, ip, (void *)block->ip);
 
     if (tinsn->id == X86_INS_JMP)
       ip = get_jump_target(tinsn);
@@ -118,14 +110,9 @@ int process_block(gdbctx *ctx, WriteBuffer *wb, struct pt_block *block,
       ip += tinsn->size;
   }
 
-  // Pre-calculate what indexes need to be incremented when updating minsketch
-  for (int i = 0; i < SKETCH_COL; ++i)
-    et->cnt_idx[i] =
-        fasthash64(&et->sip, sizeof(et->sip), i) & ctx->sketch.mask;
-
   et->fip = ip;
-  ht_insert(bb_cache, et->sip, et);
-  return process_block(ctx, wb, block, fip);
+  rht_insert(bb_cache, et->sip, et);
+  return process_block(ctx, block, fip);
 }
 
 int handle_events(struct pt_block_decoder *decoder, int status) {
@@ -232,7 +219,6 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   }
 
   int wstatus;
-  WriteBuffer wb = {0};
   uint64_t fip = 0xdeadbeefdeadbeef;
   *ctx->insn_count = 0;
   *ctx->bb_count = 0;
@@ -250,17 +236,7 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
         break;
 
       wstatus = pt_blk_next(decoder, &block, sizeof(block));
-      errcode = process_block(ctx, &wb, &block, &fip);
-      if (wb.sz[0] >= sizeof(wb.writes[0]) / sizeof(wb.writes[0][0])) {
-        // for (int i = 0; i < SKETCH_COL; ++i)
-        for (int i = 0; i < SKETCH_COL; ++i) {
-          approximate_msd_radix_sort(wb.writes[i], wb.sz[i]);
-          for (size_t j = 0; j < wb.sz[i]; ++j)
-            ctx->sketch.counters[i][wb.writes[i][j]]++;
-        }
-        memset(&wb, 0, sizeof(wb));
-      }
-
+      errcode = process_block(ctx, &block, &fip);
       if (wstatus == -pte_eos)
         break;
 
@@ -282,9 +258,6 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d (%s)\n", fip, wstatus,
              pt_errstr(-wstatus));
 
-  struct user_regs_struct xregs = {0};
-  // xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
-  // GDB_PRINTF("RIP: 0x%.16lx\n", xregs.rip);
   GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", *ctx->insn_count,
              *ctx->bb_count);
 
@@ -356,8 +329,8 @@ int pt_init(gdbctx *ctx) {
   cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
   tinsn = cs_malloc(handle);
 
-  bb_cache = ht_create();
-  bb_insn = ht_create();
+  bb_cache = rht_create(mmap_malloc, mmap_calloc, mmap_free);
+  bb_insn = rht_create(mmap_malloc, mmap_calloc, mmap_free);
 
   return 0;
 }
@@ -428,5 +401,6 @@ void pt_update_sketch(gdbctx *ctx) {
   args.trace_sz = trace_sz;
 
   pthread_create(&ctx->pt_thread, NULL, pt_thread_func, &args);
+  ctx->pt_running = 1;
   GDB_PRINTF("< %s\n", __FUNCTION__);
 }

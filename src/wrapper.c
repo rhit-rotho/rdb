@@ -379,10 +379,10 @@ int gdbstub(void *args) {
       // gdb_save_state(ctx);
       gdb_continue(ctx);
 
-      if (ctx->pt_thread) {
+      if (ctx->pt_running) {
         GDB_PRINTF("Waiting for pt_thread...\n", 0);
         pthread_join(ctx->pt_thread, NULL);
-        ctx->pt_thread = NULL;
+        ctx->pt_running = 0;
         GDB_PRINTF("Waiting for pt_thread...done\n", 0);
       }
       pbvt_commit();

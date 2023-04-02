@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/perf_event.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +19,7 @@
 static char *chars = "0123456789abcdef";
 
 char reply[0x4800];
-extern HashTable *bb_insn;
+extern RHashTable *bb_insn;
 
 int starts_with(char *str, char *prefix) {
   return strncmp(prefix, str, strlen(prefix)) == 0;
@@ -89,18 +90,16 @@ void gdb_continue(gdbctx *ctx) {
   xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
 }
 
-#include <pthread.h>
-
 void gdb_save_state(gdbctx *ctx) {
   // ctx->sketch is saved automatically :)
   ctx->regs->rax = 0;
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  if (ctx->pt_thread) {
+  if (ctx->pt_running) {
     GDB_PRINTF("Waiting for pt_thread...\n", 0);
     pthread_join(ctx->pt_thread, NULL);
-    ctx->pt_thread = NULL;
+    ctx->pt_running = 0;
     GDB_PRINTF("Waiting for pt_thread...done", 0);
   }
   pbvt_commit();
@@ -261,7 +260,7 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
       tot_insn += *ctx->insn_count;
       pbvt_checkout(c);
       for (size_t i = 0; i < ctx->bps_sz; ++i) {
-        uint64_t block_ip = (uint64_t)ht_get(bb_insn, ctx->bps[i].ip);
+        uint64_t block_ip = (uint64_t)rht_get(bb_insn, ctx->bps[i].ip);
         if (!block_ip)
           continue;
         GDB_PRINTF("Hit basic block 0x%.16lx %ld times (for bp 0x%.16lx) since "
@@ -300,7 +299,7 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     if (bp) {
       // Grab this before we checkout so we don't get the hit counts for the
       // *previous* snapshot.
-      uint64_t block_ip = (uint64_t)ht_get(bb_insn, (uint64_t)bp->ip);
+      uint64_t block_ip = (uint64_t)rht_get(bb_insn, (uint64_t)bp->ip);
       size_t hit_cnt = hit_count_get(&ctx->sketch, block_ip);
       pbvt_checkout(c->parent);
       xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);

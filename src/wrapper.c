@@ -5,8 +5,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/sched.h>
+#include <locale.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -167,21 +169,24 @@ int gdbstub(void *args) {
 
   GDB_PRINTF("Done tracking memory...\n", 0);
 
+  setlocale(LC_NUMERIC, "");
+
   // Initialize gdbctx
   gdbctx gctx = {0};
   gdbctx *ctx = &gctx;
 
   ctx->ppid = ppid;
   ctx->stopped = 1;
-  ctx->instruction_count = pbvt_calloc(1, sizeof(uint64_t));
+  ctx->insn_count = pbvt_calloc(1, sizeof(uint64_t));
+  ctx->bb_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
   ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
 
   // TODO: Calculate this based on size of executable memory
-  ctx->sketch_sz = 0x4000;
-  uint64_t *alloc = pbvt_calloc(ctx->sketch_sz * SKETCH_COL, sizeof(uint64_t));
+  sketch_init(&ctx->sketch);
+  uint64_t *alloc = pbvt_calloc(ctx->sketch.sz * SKETCH_COL, sizeof(uint64_t));
   for (int i = 0; i < SKETCH_COL; ++i)
-    ctx->sketch[i] = &alloc[i * ctx->sketch_sz];
+    ctx->sketch.counters[i] = &alloc[i * ctx->sketch.sz];
 
   xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
@@ -197,8 +202,7 @@ int gdbstub(void *args) {
   pbvt_branch_commit("main");
 
   pt_init(ctx);
-  ctx->pim = pim;
-  ctx->asid = asid;
+  ctx->image = image;
 
   int gdb_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (gdb_socket < 0)
@@ -223,13 +227,13 @@ int gdbstub(void *args) {
   if (listen(gdb_socket, 10) < 0)
     xperror("listen");
 
-  GDB_PRINTF("Waiting for connection from gdb on 0.0.0.0:%d...", port);
+  GDB_PRINTF("Waiting for connection from gdb on 0.0.0.0:%d...\n", port);
   int cfd = accept(gdb_socket, NULL, NULL);
   if (cfd < 0)
     xperror("accept");
   ctx->fd = cfd;
 
-  printf("done.\n");
+  GDB_PRINTF("Waiting for connection from gdb on 0.0.0.0:%d...done\n", port);
 
   ctx->timerfd = timerfd_create(CLOCK_REALTIME, 0);
   gdb_arm_timer(ctx);
@@ -244,7 +248,7 @@ int gdbstub(void *args) {
 
   // Main event loop
   for (;;) {
-    if (poll(pollfds, 2, -1) < 0)
+    if (poll(pollfds, 2, 1) < 0)
       xperror("poll(wrapper)");
 
     // Socket
@@ -295,18 +299,20 @@ int gdbstub(void *args) {
         }
 
         if (bp) {
-          GDB_PRINTF("Hit breakpoint! RIP: %.16lx BP: %.16lx\n",
+          GDB_PRINTF("Hit breakpoint! RIP: 0x%.16lx BP: 0x%.16lx\n",
                      ctx->regs->rip - 1, bp->ip);
           ctx->regs->rax = 0;
           xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
           ctx->regs->rip -= 1;
           breakpoint_del(ctx, bp);
           xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+        }
 
+        ctx->regs->rax = 0;
+        xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
           gdb_send_packet(ctx, "S05");
           ctx->stopped = 1;
           continue;
-        }
       } else if (WSTOPSIG(status) == SIGSEGV) {
         gdb_send_packet(ctx, "S0b");
         ctx->stopped = 1;
@@ -317,18 +323,7 @@ int gdbstub(void *args) {
         continue;
       }
 
-      GDB_PRINTF("Entering syscall:\trax: %.16lx rdi: %.16lx rsi: "
-                 "%.16lx ...\n",
-                 ctx->regs->orig_rax, ctx->regs->rdi, ctx->regs->rsi);
-
-      xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
-      waitpid(ctx->ppid, &status, 0);
-      gdb_save_state(ctx);
-
-      GDB_PRINTF("Exiting syscall:\trax: %.16lx\n", ctx->regs->rax);
-
-      gdb_continue(ctx);
-
+      GDB_PRINTF("Unhandled signal!\n", 0);
       continue;
     }
 

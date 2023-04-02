@@ -33,6 +33,7 @@
     }                                                                          \
   } while (0)
 
+// GDB_PRINTF("xptrace(%s)\n", #req);
 #define xptrace(req, pid, addr, data)                                          \
   do {                                                                         \
     if (ptrace(req, pid, addr, data) == -1) {                                  \
@@ -52,6 +53,12 @@ typedef struct Breakpoint {
   uint64_t patch;
 } Breakpoint;
 
+typedef struct Sketch {
+  uint64_t *counters[SKETCH_COL];
+  uint64_t sz;
+  uint64_t mask;
+} Sketch;
+
 typedef struct gdbctx {
   int fd;
   pid_t ppid;
@@ -61,20 +68,22 @@ typedef struct gdbctx {
 
   int timerfd;
 
-  uint64_t *sketch[SKETCH_COL];
-  uint64_t sketch_sz;
-  size_t *instruction_count;
+  Sketch sketch;
+  size_t *insn_count;
+  size_t *bb_count;
+  pthread_t pt_thread;
 
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;
   int pfd;
 
-  struct pt_image_section_cache *pim;
-  int asid;
+  struct pt_image *image;
 
   Breakpoint bps[0x20];
   size_t bps_sz;
 } gdbctx;
+
+void sketch_init(Sketch *sketch);
 
 void breakpoint_add(gdbctx *ctx, Breakpoint *bp);
 void breakpoint_del(gdbctx *ctx, Breakpoint *bp);

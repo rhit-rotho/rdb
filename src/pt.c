@@ -101,10 +101,10 @@ int process_block(gdbctx *ctx, WriteBuffer *wb, struct pt_block *block,
       break;
 
 #ifdef PT_DEBUG
-          GDB_PRINTF("PT: 0x%.16lx[", tinsn->address);
-          for (int j = 0; j < tinsn->size; ++j)
+    GDB_PRINTF("PT: 0x%.16lx[", tinsn->address);
+    for (int j = 0; j < tinsn->size; ++j)
       printf("%.2x", *(uint8_t *)(j + ip));
-          printf("]:\t%s\t%s\n", tinsn->mnemonic, tinsn->op_str);
+    printf("]:\t%s\t%s\n", tinsn->mnemonic, tinsn->op_str);
 #endif
 
     // HACK: This doesn't fully tell us which instruction corresponds to
@@ -115,7 +115,7 @@ int process_block(gdbctx *ctx, WriteBuffer *wb, struct pt_block *block,
     if (tinsn->id == X86_INS_JMP)
       ip = get_jump_target(tinsn);
     else
-    ip += tinsn->size;
+      ip += tinsn->size;
   }
 
   // Pre-calculate what indexes need to be incremented when updating minsketch

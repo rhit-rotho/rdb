@@ -1,17 +1,27 @@
+// TODO: Refactor this into libpbvt implementation
+
 #include <assert.h>
 #include <string.h>
 
-#include "hashtable.h"
 #include "mmap_malloc.h"
+#include "rdb_hashtable.h"
 
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
-HashTable *ht_create(void) {
-  HashTable *ht = mmap_malloc(sizeof(HashTable));
-  ht->cap = HT_INITIAL_CAP;
+typedef void *(*use_malloc)(size_t);
+typedef void *(*use_calloc)(size_t, size_t);
+typedef void (*use_free)(void *);
+
+RHashTable *rht_create(use_malloc tmalloc, use_calloc tcalloc, use_free tfree) {
+  RHashTable *ht = tmalloc(sizeof(RHashTable));
+  ht->malloc = tmalloc;
+  ht->calloc = tcalloc;
+  ht->free = tfree;
+
+  ht->cap = RHT_INITIAL_CAP;
   ht->size = 0;
-  ht->buckets = mmap_calloc(ht->cap, sizeof(HashBucket));
+  ht->buckets = ht->calloc(ht->cap, sizeof(RHashBucket));
 
   for (size_t i = 0; i < ht->cap; ++i)
     ht->buckets[i].size = 0;
@@ -19,11 +29,11 @@ HashTable *ht_create(void) {
   return ht;
 }
 
-void *ht_get(HashTable *ht, uint64_t key) {
-  HashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
+void *rht_get(RHashTable *ht, uint64_t key) {
+  RHashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
   for (size_t i = 0; i < bucket->size; ++i)
     if (bucket->keys[i] == key) {
-#if 1
+#if 0
       if (unlikely(i > 0)) {
         uint64_t temp_key;
         void *temp_value;
@@ -44,35 +54,35 @@ void *ht_get(HashTable *ht, uint64_t key) {
   return NULL;
 }
 
-void ht_rekey(HashTable *ht) {
-  HashTable hnt = {0};
-  HashTable *hn = &hnt;
+void rht_rekey(RHashTable *ht) {
+  RHashTable hnt = {0};
+  RHashTable *hn = &hnt;
   hn->size = 0;
   hn->cap = ht->cap * 2;
-  hn->buckets = mmap_calloc(hn->cap, sizeof(HashBucket));
+  hn->buckets = ht->calloc(hn->cap, sizeof(RHashBucket));
 
   for (size_t i = 0; i < hn->cap; ++i)
     hn->buckets[i].size = 0;
 
   // reinsert
   for (size_t i = 0; i < ht->cap; ++i) {
-    HashBucket *bucket = &ht->buckets[i];
+    RHashBucket *bucket = &ht->buckets[i];
     for (size_t j = 0; j < bucket->size; ++j) {
       // WARNING: Recursive call, make sure this doesn't reshuffle
-      ht_insert(hn, bucket->keys[j], bucket->values[j]);
+      rht_insert(hn, bucket->keys[j], bucket->values[j]);
     }
   }
-  mmap_free(ht->buckets);
-  memcpy(ht, hn, sizeof(HashTable));
+  ht->free(ht->buckets);
+  memcpy(ht, hn, sizeof(RHashTable));
 }
 
 // Assumes caller does not try to insert duplicates
-int ht_insert(HashTable *ht, uint64_t key, void *val) {
-  assert(!ht_get(ht, key));
+int rht_insert(RHashTable *ht, uint64_t key, void *val) {
+  assert(!rht_get(ht, key));
 
-  HashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
-  while (bucket->size + 1 >= HT_BUCKET_CAP) {
-    ht_rekey(ht);
+  RHashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
+  while (bucket->size + 1 >= RHT_BUCKET_CAP) {
+    rht_rekey(ht);
     bucket = &ht->buckets[key & (ht->cap - 1)];
   }
 
@@ -84,8 +94,8 @@ int ht_insert(HashTable *ht, uint64_t key, void *val) {
   return 0;
 }
 
-void *ht_remove(HashTable *ht, uint64_t key) {
-  HashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
+void *rht_remove(RHashTable *ht, uint64_t key) {
+  RHashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
   for (size_t i = 0; i < bucket->size; ++i) {
     if (bucket->keys[i] == key) {
       void *val = bucket->values[i];
@@ -105,9 +115,9 @@ void *ht_remove(HashTable *ht, uint64_t key) {
   return NULL;
 }
 
-void ht_free(HashTable *ht) {
-  mmap_free(ht->buckets);
-  mmap_free(ht);
+void rht_free(RHashTable *ht) {
+  ht->free(ht->buckets);
+  ht->free(ht);
 }
 
-size_t ht_size(HashTable *ht) { return ht->size; }
+size_t rht_size(RHashTable *ht) { return ht->size; }

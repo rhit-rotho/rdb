@@ -15,6 +15,7 @@
 #include "gdbstub.h"
 #include "pbvt.h"
 #include "pt.h"
+#include "rdb_hashtable.h"
 
 static char *chars = "0123456789abcdef";
 

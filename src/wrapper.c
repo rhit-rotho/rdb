@@ -97,8 +97,8 @@ int gdbstub(void *args) {
   if (maps < 0)
     xperror("fopen");
 
-  struct pt_image_section_cache *pim = pt_iscache_alloc(NULL);
-  int asid = 0xbad;
+  struct pt_image *image = pt_image_alloc(NULL);
+  int istatus;
 
   char buf[PROCMAPS_LINE_MAX_LENGTH];
   uint64_t image_start = 0;
@@ -121,17 +121,26 @@ int gdbstub(void *args) {
 
     if (strstr(name, APP_NAME) && image_start == 0) {
       image_start = from;
-      GDB_PRINTF("Image base: %.16lx\n", image_start);
+      GDB_PRINTF("Image base: 0x%.16lx\n", image_start);
     }
 
     // PT decoder add range
     if (is_x && strstr(name, APP_NAME)) {
-      GDB_PRINTF("(offset: %.6lx) %s %lx-%lx '%s'\n", from - image_start, flags,
-                 from, to, name);
-      asid =
-          pt_iscache_add_file(pim, name, from - image_start, to - from, from);
-      if (asid < 0)
-        GDB_PRINTF("pt_image_add_file failed!\n", 0);
+      int offset = from - image_start;
+      GDB_PRINTF("(offset: %.6lx) %s %lx-%lx '%s'\n", offset, flags, from, to,
+                 name);
+      istatus = pt_image_add_file(image, name, offset, to - from, NULL, from);
+      if (istatus < 0)
+        GDB_PRINTF("pt_image_add_file failed! %s\n", pt_errstr(-istatus));
+    }
+
+    if (is_x && strstr(name, "libc.so.6")) {
+      int offset = 0x2000;
+      GDB_PRINTF("(offset: %.6lx) %s %lx-%lx '%s'\n", offset, flags, from, to,
+                 name);
+      istatus = pt_image_add_file(image, name, offset, to - from, NULL, from);
+      if (istatus < 0)
+        GDB_PRINTF("pt_image_add_file failed! %s\n", pt_errstr(-istatus));
     }
 
     if (!is_w)
@@ -283,6 +292,26 @@ int gdbstub(void *args) {
       xptrace(PTRACE_GETSIGINFO, ctx->ppid, 0, &si);
       GDB_PRINTF("%d %d %d\n", si.si_code, si.si_errno, si.si_signo);
 
+      // Handle syscall
+      // if (WSTOPSIG(status) == SIGTRAP && si.si_code == 0x80) {
+      //   GDB_PRINTF(
+      //       "Entering syscall:\trip: 0x%.16lx rax: 0x%.16lx rdi: 0x%.16lx
+      //       rsi: "
+      //       "%.16lx ...\n",
+      //       ctx->regs->rip, ctx->regs->orig_rax, ctx->regs->rdi,
+      //       ctx->regs->rsi);
+
+      //   gdb_save_state(ctx);
+      //   xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+      //   waitpid(ctx->ppid, &status, 0);
+      //   gdb_save_state(ctx);
+
+      //   GDB_PRINTF("Exiting syscall:\trax: 0x%.16lx\n", ctx->regs->rax);
+
+      //   gdb_continue(ctx);
+      //   continue;
+      // }
+
       // ?
       if (WSTOPSIG(status) == SIGWINCH) {
         xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
@@ -310,9 +339,9 @@ int gdbstub(void *args) {
 
         ctx->regs->rax = 0;
         xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-          gdb_send_packet(ctx, "S05");
-          ctx->stopped = 1;
-          continue;
+        gdb_send_packet(ctx, "S05");
+        ctx->stopped = 1;
+        continue;
       } else if (WSTOPSIG(status) == SIGSEGV) {
         gdb_send_packet(ctx, "S0b");
         ctx->stopped = 1;
@@ -340,13 +369,30 @@ int gdbstub(void *args) {
       GDB_PRINTF("Snapshot because of timeout\n", 0);
 
       gdb_pause(ctx);
-      gdb_save_state(ctx);
+
+      // ctx->sketch is saved automatically :)
+      ctx->regs->rax = 0;
+      ctx->fpregs->cwd = 0;
+      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+      xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+      // gdb_save_state(ctx);
       gdb_continue(ctx);
+
+      if (ctx->pt_thread) {
+        GDB_PRINTF("Waiting for pt_thread...\n", 0);
+        pthread_join(ctx->pt_thread, NULL);
+        ctx->pt_thread = NULL;
+        GDB_PRINTF("Waiting for pt_thread...done\n", 0);
+      }
+      pbvt_commit();
+      memset(ctx->sketch.counters[0], 0x00,
+             SKETCH_COL * ctx->sketch.sz * sizeof(uint64_t));
 
       continue;
     }
 
-    GDB_PRINTF("Got poll but not handled!", 0);
+    // GDB_PRINTF("Got poll but not handled!", 0);
   }
 
   return 0;

@@ -18,9 +18,15 @@
 static char *chars = "0123456789abcdef";
 
 char reply[0x4800];
+extern HashTable *bb_insn;
 
 int starts_with(char *str, char *prefix) {
   return strncmp(prefix, str, strlen(prefix)) == 0;
+}
+
+void sketch_init(Sketch *sketch) {
+  sketch->sz = 0x4000;
+  sketch->mask = sketch->sz - 1;
 }
 
 void gdb_pause(gdbctx *ctx) {
@@ -45,12 +51,10 @@ void gdb_disarm_timer(gdbctx *ctx) {
 
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
-  // arm.it_interval.tv_sec = 10;
-  // arm.it_interval.tv_nsec = 0;
-  arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 10;
+  arm.it_interval.tv_sec = 1;
+  arm.it_interval.tv_nsec = 0;
+  arm.it_value.tv_sec = 1;
   arm.it_value.tv_nsec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 10;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }
@@ -60,8 +64,6 @@ void gdb_arm_timer(gdbctx *ctx) {
 
 // TODO: This doesn't work when two breakpoints are in one word.
 void breakpoint_add(gdbctx *ctx, Breakpoint *bp) {
-  GDB_PRINTF("%s: breakpoint @ %p\n", __FUNCTION__, bp->ip);
-
   uint8_t data[WORD_SIZE];
   uintptr_t addr = bp->ip;
   memcpy(data, (void *)(addr & ~WORD_MASK), WORD_SIZE);
@@ -73,8 +75,6 @@ void breakpoint_add(gdbctx *ctx, Breakpoint *bp) {
 }
 
 void breakpoint_del(gdbctx *ctx, Breakpoint *bp) {
-  GDB_PRINTF("%s: breakpoint @ %p\n", __FUNCTION__, bp->ip);
-
   uint8_t *data = (uint8_t *)&bp->patch;
   xptrace(PTRACE_POKEDATA, ctx->ppid, bp->ip & ~WORD_MASK, bp->patch);
   assert(*(uint8_t *)bp->ip == data[bp->ip & WORD_MASK]);
@@ -89,14 +89,23 @@ void gdb_continue(gdbctx *ctx) {
   xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
 }
 
+#include <pthread.h>
+
 void gdb_save_state(gdbctx *ctx) {
   // ctx->sketch is saved automatically :)
   ctx->regs->rax = 0;
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+  if (ctx->pt_thread) {
+    GDB_PRINTF("Waiting for pt_thread...\n", 0);
+    pthread_join(ctx->pt_thread, NULL);
+    ctx->pt_thread = NULL;
+    GDB_PRINTF("Waiting for pt_thread...done", 0);
+  }
   pbvt_commit();
-  memset(ctx->sketch[0], 0x00, SKETCH_COL * ctx->sketch_sz * sizeof(uint64_t));
+  memset(ctx->sketch.counters[0], 0x00,
+         SKETCH_COL * ctx->sketch.sz * sizeof(uint64_t));
 }
 
 uint8_t gdb_checksum(char *c, size_t n) {
@@ -109,6 +118,8 @@ uint8_t gdb_checksum(char *c, size_t n) {
 void gdb_send_empty(gdbctx *ctx) { gdb_send_packet(ctx, ""); }
 
 void gdb_send_packet(gdbctx *ctx, char *data) {
+  // GDB_PRINTF("Server: \"%s\"\n", data);
+
   size_t reply_sz = strlen(data) + 0x20;
   assert(reply_sz < sizeof(reply));
   uint8_t c = gdb_checksum(data, strlen(data));
@@ -241,14 +252,24 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 
     Commit *c = pbvt_head();
     Breakpoint *bp = NULL;
+
+    uint64_t tot_insn = 0;
+
     while (c && c != pbvt_branch_head("head") && !bp) {
-      GDB_PRINTF("Checking out to %.16lx (skipped %ld instructions)\n", c->hash,
-                 *ctx->instruction_count);
+      GDB_PRINTF("Checking out to 0x%.16lx (skipped %'ld instructions)\n",
+                 c->hash, *ctx->insn_count);
+      tot_insn += *ctx->insn_count;
       pbvt_checkout(c);
       for (size_t i = 0; i < ctx->bps_sz; ++i) {
-        GDB_PRINTF("Hit 0x%.16lx %d times since the last checkpoint\n",
-                   ctx->bps[i].ip, insn_hit_count_get(ctx, ctx->bps[i].ip));
-        if (insn_hit_count_get(ctx, ctx->bps[i].ip) > 0) {
+        uint64_t block_ip = (uint64_t)ht_get(bb_insn, ctx->bps[i].ip);
+        if (!block_ip)
+          continue;
+        GDB_PRINTF("Hit basic block 0x%.16lx %ld times (for bp 0x%.16lx) since "
+                   "the last "
+                   "checkpoint\n",
+                   block_ip, hit_count_get(&ctx->sketch, block_ip),
+                   ctx->bps[i].ip);
+        if (hit_count_get(&ctx->sketch, block_ip) > 0) {
           bp = &ctx->bps[i];
           break;
         }
@@ -257,13 +278,16 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     }
 
     if (c == pbvt_branch_head("head")) {
-      GDB_PRINTF("Rewound to head! IP: 0x%.16lx\n", ctx->regs->rip);
+      GDB_PRINTF("Rewound to head! IP: 0x%.16lx (tot: %'ld)\n", ctx->regs->rip,
+                 tot_insn);
       xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
       xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
       ctx->stopped = 1;
       gdb_send_packet(ctx, "S05"); // sigtrap x86
       break;
     }
+
+    GDB_PRINTF("Skipped %'ld total instructions!\n", tot_insn);
 
     xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
     xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
@@ -276,12 +300,13 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     if (bp) {
       // Grab this before we checkout so we don't get the hit counts for the
       // *previous* snapshot.
-      size_t hit_cnt = insn_hit_count_get(ctx, bp->ip);
+      uint64_t block_ip = (uint64_t)ht_get(bb_insn, (uint64_t)bp->ip);
+      size_t hit_cnt = hit_count_get(&ctx->sketch, block_ip);
       pbvt_checkout(c->parent);
       xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
       xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
 
-      GDB_PRINTF("Found breakpoint, rewinding starting at %.16lx!\n",
+      GDB_PRINTF("Found breakpoint, rewinding starting at 0x%.16lx!\n",
                  ctx->regs->rip);
       breakpoint_add(ctx, bp);
 
@@ -404,7 +429,7 @@ void gdb_handle_g_commands(gdbctx *ctx, char *buf, size_t n) {
   }
 
   data[xsave_size * 2] = '\0';
-  GDB_PRINTF("REGISTERS: %s\n", data);
+  // GDB_PRINTF("REGISTERS: %s\n", data);
 
   gdb_send_packet(ctx, data);
 }

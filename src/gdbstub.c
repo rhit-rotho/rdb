@@ -2,7 +2,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/perf_event.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +26,7 @@ int starts_with(char *str, char *prefix) {
 }
 
 void sketch_init(Sketch *sketch) {
-  sketch->sz = 0x4000;
+  sketch->sz = 0x1000;
   sketch->mask = sketch->sz - 1;
 }
 
@@ -97,12 +96,6 @@ void gdb_save_state(gdbctx *ctx) {
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  if (ctx->pt_running) {
-    GDB_PRINTF("Waiting for pt_thread...\n", 0);
-    pthread_join(ctx->pt_thread, NULL);
-    ctx->pt_running = 0;
-    GDB_PRINTF("Waiting for pt_thread...done", 0);
-  }
   pbvt_commit();
   memset(ctx->sketch.counters[0], 0x00,
          SKETCH_COL * ctx->sketch.sz * sizeof(uint64_t));

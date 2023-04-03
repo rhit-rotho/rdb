@@ -8,7 +8,6 @@
 #include <locale.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -193,7 +192,7 @@ int gdbstub(void *args) {
 
   // TODO: Calculate this based on size of executable memory
   sketch_init(&ctx->sketch);
-  uint64_t *alloc = pbvt_calloc(ctx->sketch.sz * SKETCH_COL, sizeof(uint64_t));
+  uint32_t *alloc = pbvt_calloc(ctx->sketch.sz * SKETCH_COL, sizeof(uint32_t));
   for (int i = 0; i < SKETCH_COL; ++i)
     ctx->sketch.counters[i] = &alloc[i * ctx->sketch.sz];
 
@@ -369,26 +368,8 @@ int gdbstub(void *args) {
       GDB_PRINTF("Snapshot because of timeout\n", 0);
 
       gdb_pause(ctx);
-
-      // ctx->sketch is saved automatically :)
-      ctx->regs->rax = 0;
-      ctx->fpregs->cwd = 0;
-      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-      xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-
-      // gdb_save_state(ctx);
+      gdb_save_state(ctx);
       gdb_continue(ctx);
-
-      if (ctx->pt_running) {
-        GDB_PRINTF("Waiting for pt_thread...\n", 0);
-        pthread_join(ctx->pt_thread, NULL);
-        ctx->pt_running = 0;
-        GDB_PRINTF("Waiting for pt_thread...done\n", 0);
-      }
-      pbvt_commit();
-      memset(ctx->sketch.counters[0], 0x00,
-             SKETCH_COL * ctx->sketch.sz * sizeof(uint64_t));
-
       continue;
     }
 

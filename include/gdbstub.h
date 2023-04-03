@@ -59,8 +59,8 @@ typedef struct Breakpoint {
 } Breakpoint;
 
 typedef struct Sketch {
-  uint64_t *counters[SKETCH_COL];
-  uint64_t sz;
+  uint32_t *counters[SKETCH_COL];
+  uint32_t sz;
   uint64_t mask;
 } Sketch;
 
@@ -76,9 +76,6 @@ typedef struct gdbctx {
   Sketch sketch;
   size_t *insn_count;
   size_t *bb_count;
-
-  pthread_t pt_thread;
-  uint8_t pt_running;
 
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;

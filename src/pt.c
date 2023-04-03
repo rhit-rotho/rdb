@@ -1,7 +1,6 @@
 #include <assert.h>
 #include <capstone/capstone.h>
 #include <linux/perf_event.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -47,28 +46,50 @@ __attribute__((hot)) inline uint64_t hit_count_get(Sketch *sketch,
   return cnt;
 }
 
-uint64_t get_jump_target(cs_insn *insn) {
-  for (int i = 0; i < insn->detail->x86.op_count; i++) {
-    if (insn->detail->x86.operands[i].type == X86_OP_IMM) {
-      return insn->detail->x86.operands[i].imm;
-    }
+inline uint64_t get_jump_target(cs_insn *insn) {
+  // for (int i = 0; i < insn->detail->x86.op_count; i++)
+  //   if (insn->detail->x86.operands[i].type == X86_OP_IMM)
+  //     return insn->detail->x86.operands[i].imm;
+
+  // Non-portable
+  return insn->detail->x86.operands[0].imm;
+}
+
+bool is_control_flow_insn(cs_insn *insn) {
+  switch (insn->id) {
+  case X86_INS_JMP:
+  case X86_INS_JE:
+  case X86_INS_JNE:
+  case X86_INS_JA:
+  case X86_INS_JAE:
+  case X86_INS_JB:
+  case X86_INS_JBE:
+  case X86_INS_JG:
+  case X86_INS_JGE:
+  case X86_INS_JL:
+  case X86_INS_JLE:
+  case X86_INS_CALL:
+  case X86_INS_RET:
+    return true;
+  default:
+    return false;
   }
-  return 0;
 }
 
 // TODO: We need to convert between what Intel PT considers "blocks"
-// (instruction flow that can be recovered without any conditionals) to "basic
-// blocks" (straight line sequence that doesn't contain any intra-block jumps).
+// (instruction flow that can be recovered without any conditionals) to
+// "basic blocks" (straight line sequence that doesn't contain any
+// intra-block jumps).
 int process_block(gdbctx *ctx, struct pt_block *block, uint64_t *fip) {
   uint16_t ninsn;
   uint64_t ip;
 
   CacheEntry *et = (CacheEntry *)rht_get(bb_cache, block->ip);
-  if (et) {
-    (*ctx->bb_count)++;
-    *fip = et->fip;
-    *ctx->insn_count += block->ninsn;
-    hit_count_inc(&ctx->sketch, block->ip);
+  if (et != NULL) {
+    // (*ctx->bb_count)++;
+    // *fip = et->fip;
+    // *ctx->insn_count += block->ninsn;
+    // hit_count_inc(&ctx->sketch, block->ip);
     return 0;
   }
 
@@ -78,14 +99,6 @@ int process_block(gdbctx *ctx, struct pt_block *block, uint64_t *fip) {
   et->sip = block->ip;
   ip = block->ip;
   for (ninsn = 0; ninsn < block->ninsn; ++ninsn) {
-    struct pt_insn insn;
-
-    memset(&insn, 0, sizeof(insn));
-    insn.speculative = block->speculative;
-    insn.isid = block->isid;
-    insn.mode = block->mode;
-    insn.ip = ip;
-
     const uint8_t *code = (uint8_t *)ip;
     uint64_t address = ip;
     size_t sz = 0x10; // max size of x86 insn is 15 bytes
@@ -99,10 +112,15 @@ int process_block(gdbctx *ctx, struct pt_block *block, uint64_t *fip) {
     printf("]:\t%s\t%s\n", tinsn->mnemonic, tinsn->op_str);
 #endif
 
-    // HACK: This doesn't fully tell us which instruction corresponds to
-    // which basic blocks unfortunately :(
-    if (!rht_get(bb_insn, ip))
+    // TODO: At this point BBs must be split, this may be difficult if we end up
+    // interrupting the process inside of a large block many times.
+    if (rht_get(bb_insn, ip)) {
+      // GDB_PRINTF(
+      //     "Warning! Instruction %.16lx is already contained in BB: %.16lx\n",
+      //     ip, rht_get(bb_insn, ip));
+    } else {
       rht_insert(bb_insn, ip, (void *)block->ip);
+    }
 
     if (tinsn->id == X86_INS_JMP)
       ip = get_jump_target(tinsn);
@@ -112,6 +130,8 @@ int process_block(gdbctx *ctx, struct pt_block *block, uint64_t *fip) {
 
   et->fip = ip;
   rht_insert(bb_cache, et->sip, et);
+
+  GDB_PRINTF("bb: 0x%.16lx (%ld instructions)\n", block->ip, block->ninsn);
   return process_block(ctx, block, fip);
 }
 
@@ -197,18 +217,9 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   config.begin = buf;
   config.end = buf + n;
 
-  config.cpu.vendor = pcv_intel;
-  config.cpu.family = (uint16_t)6;
-  config.cpu.model = (uint8_t)158;
-  config.cpu.stepping = (uint8_t)10;
-
-  int errcode;
-  errcode = pt_cpu_errata(&config.errata, &config.cpu);
-  if (errcode < 0)
-    return errcode;
-
   double start = get_time();
-  GDB_PRINTF("Starting PT parse...\n", 0);
+  // GDB_PRINTF("Starting PT parse...\n", 0);
+  printf("Starting PT parse...\n", 0);
 
   decoder = pt_blk_alloc_decoder(&config);
   int image_status = pt_blk_set_image(decoder, ctx->image);
@@ -253,8 +264,7 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
       break;
   }
 
-  GDB_PRINTF("Starting PT parse...done, took %lf seconds\n",
-             get_time() - start);
+  printf("Starting PT parse...done, took %lf seconds\n", get_time() - start);
   GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d (%s)\n", fip, wstatus,
              pt_errstr(-wstatus));
 
@@ -337,20 +347,6 @@ int pt_init(gdbctx *ctx) {
 
 uint8_t ptbuf[2 * AUX_SIZE * PAGE_SIZE];
 
-typedef struct PTArgs {
-  gdbctx *ctx;
-  uint8_t *buf;
-  uint64_t trace_sz;
-} PTArgs;
-
-PTArgs args;
-
-void *pt_thread_func(void *arg) {
-  PTArgs *args = (PTArgs *)arg;
-  pt_process_trace(args->ctx, args->buf, args->trace_sz);
-  return NULL;
-}
-
 // TODO: Updates to aux_tail must be atomic, we don't actually need to worry so
 // much because we know that our process is stopped and perf events have been
 // disabled.
@@ -377,8 +373,9 @@ void pt_update_sketch(gdbctx *ctx) {
     memcpy(ptbuf, ctx->aux + aux_tail, ctx->header->aux_size - aux_tail);
     memcpy(ptbuf + (ctx->header->aux_size - aux_tail), ctx->aux, aux_head);
   }
-  ctx->header->aux_tail = aux_head;
   asm volatile("" ::: "memory"); // Ensure the memory barrier
+  assert(ctx->header->aux_head == aux_head);
+  ctx->header->aux_tail = aux_head;
 
   // Check if aux starts with PSB
   if (memcmp(ptbuf, PT_PROLOGUE, 16) != 0) {
@@ -396,11 +393,6 @@ void pt_update_sketch(gdbctx *ctx) {
   // printf("\n");
 #endif
 
-  args.buf = ptbuf;
-  args.ctx = ctx;
-  args.trace_sz = trace_sz;
-
-  pthread_create(&ctx->pt_thread, NULL, pt_thread_func, &args);
-  ctx->pt_running = 1;
+  pt_process_trace(ctx, ptbuf, trace_sz);
   GDB_PRINTF("< %s\n", __FUNCTION__);
 }

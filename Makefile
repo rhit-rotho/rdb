@@ -30,10 +30,10 @@ PROGRAM                = libwrapper.so
 #CC                    = $(CXX)
 
 # The extra pre-processor and compiler options; applies to both C and C++ compiling as well as LD. 
-EXTRA_CFLAGS           = -fPIC -static-pie -fdata-sections -ffunction-sections -fno-builtin -nostdlib -g2 -gdwarf-3
+EXTRA_CFLAGS           = -ggdb3 -fPIC -fdata-sections -ffunction-sections -fno-builtin -nostdlib
 
 # The extra linker options, e.g. "-lmysqlclient -lz"
-EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt -lipt -lcapstone
+EXTRA_LDFLAGS          =  -L/usr/local/lib -lpbvt -lcapstone
 
 # Specify the include dirs, e.g. "-I/usr/include/mysql -I./include -I/usr/include -I/usr/local/include".
 INCLUDE                = -Iinclude
@@ -90,8 +90,8 @@ HDREXTS = .h .H .hh .hpp .HPP .h++ .hxx .hp
 
 # The pre-processor and compiler options.
 # Users can override those variables from the command line.
-CFLAGS  = -O2 #-DNDEBUG # -DNDEBUG
-CXXFLAGS= -O2 #-DNDEBUG # -DNDEBUG
+CFLAGS  = -O2 # -DNDEBUG
+CXXFLAGS= -O2 # -DNDEBUG
 
 # The command used to delete file.
 RM     = rm -f

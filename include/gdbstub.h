@@ -48,11 +48,6 @@
     exit(-1);                                                                  \
   } while (0);
 
-typedef struct CacheEntry {
-  uint64_t sip;
-  uint64_t fip;
-} CacheEntry;
-
 typedef struct Breakpoint {
   uintptr_t ip;
   uint64_t patch;
@@ -77,11 +72,16 @@ typedef struct gdbctx {
   size_t *insn_count;
   size_t *bb_count;
 
+  double prev_snapshot;
+
+  pthread_t pt_thread;
+  int pt_running;
+
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;
   int pfd;
 
-  struct pt_image *image;
+  int snapshot_counter;
 
   Breakpoint bps[0x20];
   size_t bps_sz;

@@ -52,6 +52,8 @@ void sighandler(int signo) {
   exit(0);
 }
 
+double get_time(void);
+
 int read_line(int fd, char *buf, size_t n) {
   size_t nbytes = 0;
   while (nbytes < n && read(fd, buf, 1)) {
@@ -96,11 +98,7 @@ int gdbstub(void *args) {
   if (maps < 0)
     xperror("fopen");
 
-  struct pt_image *image = pt_image_alloc(NULL);
-  int istatus;
-
   char buf[PROCMAPS_LINE_MAX_LENGTH];
-  uint64_t image_start = 0;
   while (read_line(maps, buf, PROCMAPS_LINE_MAX_LENGTH)) {
     char flags[5] = {0};
     char name[PATH_MAX] = {0};
@@ -118,28 +116,8 @@ int gdbstub(void *args) {
     prot |= is_w ? PROT_WRITE : PROT_NONE;
     prot |= is_x ? PROT_EXEC : PROT_NONE;
 
-    if (strstr(name, APP_NAME) && image_start == 0) {
-      image_start = from;
-      GDB_PRINTF("Image base: 0x%.16lx\n", image_start);
-    }
-
-    // PT decoder add range
     if (is_x && strstr(name, APP_NAME)) {
-      int offset = from - image_start;
-      GDB_PRINTF("(offset: %.6lx) %s %lx-%lx '%s'\n", offset, flags, from, to,
-                 name);
-      istatus = pt_image_add_file(image, name, offset, to - from, NULL, from);
-      if (istatus < 0)
-        GDB_PRINTF("pt_image_add_file failed! %s\n", pt_errstr(-istatus));
-    }
-
-    if (is_x && strstr(name, "libc.so.6")) {
-      int offset = 0x2000;
-      GDB_PRINTF("(offset: %.6lx) %s %lx-%lx '%s'\n", offset, flags, from, to,
-                 name);
-      istatus = pt_image_add_file(image, name, offset, to - from, NULL, from);
-      if (istatus < 0)
-        GDB_PRINTF("pt_image_add_file failed! %s\n", pt_errstr(-istatus));
+      GDB_PRINTF("[exec] %s 0x%.16lx - 0x%.16lx\n", flags, from, to);
     }
 
     if (!is_w)
@@ -157,7 +135,7 @@ int gdbstub(void *args) {
     // }
 
     if (strcmp(name, "[stack]") == 0) {
-      GDB_PRINTF("[stack] %s %lx-%lx\n", flags, from, to);
+      GDB_PRINTF("[stack] %s 0x%.16lx - 0x%.16lx\n", flags, from, to);
       pbvt_track_range((void *)from, to - from, prot);
       continue;
     }
@@ -210,7 +188,6 @@ int gdbstub(void *args) {
   pbvt_branch_commit("main");
 
   pt_init(ctx);
-  ctx->image = image;
 
   int gdb_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (gdb_socket < 0)
@@ -291,33 +268,7 @@ int gdbstub(void *args) {
       xptrace(PTRACE_GETSIGINFO, ctx->ppid, 0, &si);
       GDB_PRINTF("%d %d %d\n", si.si_code, si.si_errno, si.si_signo);
 
-      // Handle syscall
-      // if (WSTOPSIG(status) == SIGTRAP && si.si_code == 0x80) {
-      //   GDB_PRINTF(
-      //       "Entering syscall:\trip: 0x%.16lx rax: 0x%.16lx rdi: 0x%.16lx
-      //       rsi: "
-      //       "%.16lx ...\n",
-      //       ctx->regs->rip, ctx->regs->orig_rax, ctx->regs->rdi,
-      //       ctx->regs->rsi);
-
-      //   gdb_save_state(ctx);
-      //   xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
-      //   waitpid(ctx->ppid, &status, 0);
-      //   gdb_save_state(ctx);
-
-      //   GDB_PRINTF("Exiting syscall:\trax: 0x%.16lx\n", ctx->regs->rax);
-
-      //   gdb_continue(ctx);
-      //   continue;
-      // }
-
-      // ?
-      if (WSTOPSIG(status) == SIGWINCH) {
-        xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
-        continue;
-      }
-
-      if (WSTOPSIG(status) == SIGTRAP) {
+      if (WSTOPSIG(status) == SIGTRAP && si.si_code == 0x80) {
         Breakpoint *bp = NULL;
         for (size_t i = 0; i < ctx->bps_sz; ++i) {
           if (ctx->regs->rip - 1 == ctx->bps[i].ip) {
@@ -351,6 +302,30 @@ int gdbstub(void *args) {
         continue;
       }
 
+      // Handle syscall
+      if (WSTOPSIG(status) == SIGTRAP) {
+        GDB_PRINTF("Entering syscall:\trip: 0x%.16lx rax: 0x%.16lx rdi: "
+                   "0x%.16lx rsi : %.16lx ...\n",
+                   ctx->regs->rip, ctx->regs->orig_rax, ctx->regs->rdi,
+                   ctx->regs->rsi);
+
+        gdb_save_state(ctx);
+        xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+        waitpid(ctx->ppid, &status, 0);
+        gdb_save_state(ctx);
+
+        GDB_PRINTF("Exiting syscall:\trax: 0x%.16lx\n", ctx->regs->rax);
+
+        gdb_continue(ctx);
+        continue;
+      }
+
+      // ?
+      if (WSTOPSIG(status) == SIGWINCH) {
+        xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
+        continue;
+      }
+
       GDB_PRINTF("Unhandled signal!\n", 0);
       continue;
     }
@@ -365,11 +340,19 @@ int gdbstub(void *args) {
       if (ctx->stopped)
         continue;
 
-      GDB_PRINTF("Snapshot because of timeout\n", 0);
+      GDB_PRINTF("Snapshot because of timeout elapsed %lf\n",
+                 get_time() - ctx->prev_snapshot);
 
       gdb_pause(ctx);
-      gdb_save_state(ctx);
+      if (ctx->snapshot_counter == 0x10) {
+        gdb_save_state(ctx);
+        ctx->snapshot_counter = 0;
+      } else {
+        ctx->snapshot_counter += 1;
+      }
       gdb_continue(ctx);
+
+      ctx->prev_snapshot = get_time();
       continue;
     }
 

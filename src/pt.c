@@ -1,33 +1,28 @@
+#define _GNU_SOURCE
 #include <assert.h>
 #include <capstone/capstone.h>
 #include <linux/perf_event.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <time.h>
 
+#include "decoder.h"
 #include "fasthash.h"
 #include "mmap_malloc.h"
 #include "pt.h"
 #include "rdb_hashtable.h"
 
 // #define PT_DEBUG
-#define AUX_SIZE (512)
-
-// PSB, PSBEND
-const uint8_t PT_PROLOGUE[] = {0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
-                               0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
-                               0x02, 0x82, 0x02, 0x82, 0x02, 0x23};
-
-csh handle;
-cs_insn *tinsn;
-RHashTable *bb_cache;
-RHashTable *bb_insn;
+#define AUX_SIZE (256)
 
 __attribute__((hot)) inline void hit_count_inc(Sketch *sketch, uint64_t ip) {
   for (int i = 0; i < SKETCH_COL; ++i)
@@ -46,159 +41,8 @@ __attribute__((hot)) inline uint64_t hit_count_get(Sketch *sketch,
   return cnt;
 }
 
-inline uint64_t get_jump_target(cs_insn *insn) {
-  // for (int i = 0; i < insn->detail->x86.op_count; i++)
-  //   if (insn->detail->x86.operands[i].type == X86_OP_IMM)
-  //     return insn->detail->x86.operands[i].imm;
-
-  // Non-portable
-  return insn->detail->x86.operands[0].imm;
-}
-
-bool is_control_flow_insn(cs_insn *insn) {
-  switch (insn->id) {
-  case X86_INS_JMP:
-  case X86_INS_JE:
-  case X86_INS_JNE:
-  case X86_INS_JA:
-  case X86_INS_JAE:
-  case X86_INS_JB:
-  case X86_INS_JBE:
-  case X86_INS_JG:
-  case X86_INS_JGE:
-  case X86_INS_JL:
-  case X86_INS_JLE:
-  case X86_INS_CALL:
-  case X86_INS_RET:
-    return true;
-  default:
-    return false;
-  }
-}
-
-// TODO: We need to convert between what Intel PT considers "blocks"
-// (instruction flow that can be recovered without any conditionals) to
-// "basic blocks" (straight line sequence that doesn't contain any
-// intra-block jumps).
-int process_block(gdbctx *ctx, struct pt_block *block, uint64_t *fip) {
-  uint16_t ninsn;
-  uint64_t ip;
-
-  CacheEntry *et = (CacheEntry *)rht_get(bb_cache, block->ip);
-  if (et != NULL) {
-    // (*ctx->bb_count)++;
-    // *fip = et->fip;
-    // *ctx->insn_count += block->ninsn;
-    // hit_count_inc(&ctx->sketch, block->ip);
-    return 0;
-  }
-
-  GDB_PRINTF("New BB! 0x%.16lx\n", block->ip);
-
-  et = malloc(sizeof(CacheEntry));
-  et->sip = block->ip;
-  ip = block->ip;
-  for (ninsn = 0; ninsn < block->ninsn; ++ninsn) {
-    const uint8_t *code = (uint8_t *)ip;
-    uint64_t address = ip;
-    size_t sz = 0x10; // max size of x86 insn is 15 bytes
-    if (!cs_disasm_iter(handle, &code, &sz, &address, tinsn))
-      break;
-
-#ifdef PT_DEBUG
-    GDB_PRINTF("PT: 0x%.16lx[", tinsn->address);
-    for (int j = 0; j < tinsn->size; ++j)
-      printf("%.2x", *(uint8_t *)(j + ip));
-    printf("]:\t%s\t%s\n", tinsn->mnemonic, tinsn->op_str);
-#endif
-
-    // TODO: At this point BBs must be split, this may be difficult if we end up
-    // interrupting the process inside of a large block many times.
-    if (rht_get(bb_insn, ip)) {
-      // GDB_PRINTF(
-      //     "Warning! Instruction %.16lx is already contained in BB: %.16lx\n",
-      //     ip, rht_get(bb_insn, ip));
-    } else {
-      rht_insert(bb_insn, ip, (void *)block->ip);
-    }
-
-    if (tinsn->id == X86_INS_JMP)
-      ip = get_jump_target(tinsn);
-    else
-      ip += tinsn->size;
-  }
-
-  et->fip = ip;
-  rht_insert(bb_cache, et->sip, et);
-
-  GDB_PRINTF("bb: 0x%.16lx (%ld instructions)\n", block->ip, block->ninsn);
-  return process_block(ctx, block, fip);
-}
-
-int handle_events(struct pt_block_decoder *decoder, int status) {
-  while (status & pts_event_pending) {
-    struct pt_event event;
-    status = pt_blk_event(decoder, &event, sizeof(event));
-    if (status < 0)
-      break;
-  }
-
-  return status;
-}
-
-#define RADIX 4096
-#define NUM_BITS 50
-
-void msd_radix_sort(uint64_t *arr, int64_t left, int64_t right, int64_t exp) {
-  if (left >= right || exp < 0) {
-    return;
-  }
-
-  size_t count[RADIX + 1] = {0};
-  bool is_uniform = true;
-  uint64_t prev_digit = (arr[left] >> exp) & (RADIX - 1);
-
-  for (int64_t i = left; i <= right; ++i) {
-    uint64_t digit = (arr[i] >> exp) & (RADIX - 1);
-    count[digit + 1]++;
-    if (digit != prev_digit) {
-      is_uniform = false;
-    }
-    prev_digit = digit;
-  }
-
-  if (is_uniform)
-    return;
-
-  for (size_t i = 1; i < RADIX + 1; ++i)
-    count[i] += count[i - 1];
-
-  uint64_t *temp = (uint64_t *)malloc((right - left + 1) * sizeof(uint64_t));
-  if (!temp) {
-    fprintf(stderr, "Failed to allocate memory for the temporary array.\n");
-    exit(EXIT_FAILURE);
-  }
-
-  for (int64_t i = left; i <= right; ++i) {
-    uint64_t digit = (arr[i] >> exp) & (RADIX - 1);
-    temp[count[digit]++] = arr[i];
-  }
-
-  for (int64_t i = left; i <= right; ++i) {
-    arr[i] = temp[i - left];
-  }
-
-  free(temp);
-
-  for (size_t i = 0; i < RADIX; ++i) {
-    msd_radix_sort(arr, left + count[i], left + count[i + 1] - 1,
-                   exp - NUM_BITS);
-  }
-}
-
-void approximate_msd_radix_sort(uint64_t *arr, size_t size) {
-  msd_radix_sort(arr, 0, size - 1, 64 - NUM_BITS);
-}
+#define likely(x) __builtin_expect(x, 1)
+#define unlikely(x) __builtin_expect(x, 0)
 
 double get_time() {
   struct timespec tp;
@@ -206,74 +50,70 @@ double get_time() {
   return tp.tv_sec + tp.tv_nsec * 1e-9;
 }
 
+typedef struct PTArgs {
+  gdbctx *ctx;
+  uint8_t *buf;
+  size_t n;
+} PTArgs;
+
+PTDecoder *dec;
+PTArgs pt_args;
+pthread_attr_t pattr;
+
+int counter = 0;
 int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   UNUSED(ctx);
 
-  struct pt_block_decoder *decoder;
-  struct pt_config config;
+  // char fname[0x20];
+  // snprintf(fname, sizeof(fname), "trace%.2d.out", counter++);
+  // FILE *f = fopen(fname, "w");
+  // for (size_t i = 0; i < n; ++i) {
+  //   fprintf(f, "%c", buf[i]);
+  // }
+  // fclose(f);
 
-  pt_config_init(&config);
-  config.size = sizeof(config);
-  config.begin = buf;
-  config.end = buf + n;
+  // usleep(1000 * 1000 * 40);
 
   double start = get_time();
-  // GDB_PRINTF("Starting PT parse...\n", 0);
-  printf("Starting PT parse...\n", 0);
 
-  decoder = pt_blk_alloc_decoder(&config);
-  int image_status = pt_blk_set_image(decoder, ctx->image);
-  if (image_status < 0) {
-    GDB_PRINTF("pt_blk_set_image(%p): %s\n", ctx->image,
-               pt_errstr(image_status));
-    exit(-1);
+  // struct user_regs_struct xregs = {0};
+  // xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+
+  // TODO: We need these to be configurable to support rewind and replay
+  if (!dec->last_ip) {
+    dec->last_ip = ctx->regs->rip;
+    dec->ip = ctx->regs->rip;
   }
 
-  int wstatus;
-  uint64_t fip = 0xdeadbeefdeadbeef;
-  *ctx->insn_count = 0;
-  *ctx->bb_count = 0;
-  for (;;) {
-    wstatus = pt_blk_sync_forward(decoder);
-    if (wstatus < 0)
-      break;
-
-    for (;;) {
-      struct pt_block block;
-      int errcode;
-
-      wstatus = handle_events(decoder, wstatus);
-      if (wstatus < 0)
-        break;
-
-      wstatus = pt_blk_next(decoder, &block, sizeof(block));
-      errcode = process_block(ctx, &block, &fip);
-      if (wstatus == -pte_eos)
-        break;
-
-      if (errcode < 0)
-        wstatus = errcode;
-      if (wstatus < 0)
-        break;
-    }
-
-    // TODO: Handle error
-    if (wstatus == -pte_eos)
-      break;
-    if (wstatus < 0)
-      break;
-  }
+  printf("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
+  int ret = dec_decode_trace(dec, buf, n);
 
   printf("Starting PT parse...done, took %lf seconds\n", get_time() - start);
-  GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d (%s)\n", fip, wstatus,
-             pt_errstr(-wstatus));
+  GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d\n", dec->last_ip, ret);
 
   GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", *ctx->insn_count,
              *ctx->bb_count);
 
-  pt_blk_free_decoder(decoder);
-
   return 0;
+}
+
+uint64_t empty[] = {0, 0, 0, 0};
+void basic_block_callback(void *arg, BasicBlock *bb) {
+  gdbctx *ctx = arg;
+  (*ctx->bb_count)++;
+  (*ctx->insn_count) += bb->ninsns;
+  // We don't need any info from the basic block, so just insert the address
+  if (unlikely(memcmp(bb->counters, empty, sizeof(empty)) == 0))
+    for (int i = 0; i < SKETCH_COL; ++i)
+      bb->counters[i] = fasthash64(&bb, sizeof(bb), i) & ctx->sketch.mask;
+  for (int i = 0; i < SKETCH_COL; ++i)
+    ctx->sketch.counters[i][bb->counters[i]]++;
+}
+
+void *pt_fork_func(void *args) {
+  PTArgs *a = (PTArgs *)args;
+  pt_process_trace(a->ctx, a->buf, a->n);
+  return NULL;
 }
 
 int pt_init(gdbctx *ctx) {
@@ -296,6 +136,8 @@ int pt_init(gdbctx *ctx) {
   attr.config |= 0 << 9;
   // /sys/bus/event_source/devices/intel_pt/format/tsc
   attr.config |= 0 << 10;
+  // /sys/bus/event_source/devices/intel_pt/format/noretcomp
+  attr.config |= 1 << 11;
   // /sys/bus/event_source/devices/intel_pt/format/branch
   attr.config |= 1 << 13;
   // /sys/bus/event_source/devices/intel_pt/format/psb_period
@@ -332,15 +174,27 @@ int pt_init(gdbctx *ctx) {
   if (ctx->aux == MAP_FAILED)
     xperror("mmap");
 
-  if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
-    GDB_PRINTF("cs_open: %s\n", cs_strerror(cs_errno(handle)));
-    return -1;
-  }
-  cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-  tinsn = cs_malloc(handle);
+  dec = malloc(sizeof(PTDecoder));
+  dec_init(dec);
+  dec->on_bb = basic_block_callback;
+  dec->on_bb_ctx = ctx;
 
-  bb_cache = rht_create(mmap_malloc, mmap_calloc, mmap_free);
-  bb_insn = rht_create(mmap_malloc, mmap_calloc, mmap_free);
+  int core = 11; // Change this to the desired core number
+
+  // Initialize thread attributes
+  pthread_attr_init(&pattr);
+
+  // Initialize CPU set
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core, &cpuset);
+
+  // Set thread affinity
+  int result = pthread_attr_setaffinity_np(&pattr, sizeof(cpu_set_t), &cpuset);
+  if (result != 0) {
+    perror("pthread_attr_setaffinity_np");
+    exit(1);
+  }
 
   return 0;
 }
@@ -377,13 +231,6 @@ void pt_update_sketch(gdbctx *ctx) {
   assert(ctx->header->aux_head == aux_head);
   ctx->header->aux_tail = aux_head;
 
-  // Check if aux starts with PSB
-  if (memcmp(ptbuf, PT_PROLOGUE, 16) != 0) {
-    memmove(ptbuf + sizeof(PT_PROLOGUE), ptbuf, trace_sz);
-    memcpy(ptbuf, PT_PROLOGUE, sizeof(PT_PROLOGUE));
-    trace_sz += sizeof(PT_PROLOGUE);
-  }
-
   GDB_PRINTF("Read from 0x%.6lx to 0x%.6lx (tot_size: 0x%.6lx)\n", aux_tail,
              aux_head, ctx->header->aux_size);
 #ifdef PT_DEBUG
@@ -393,6 +240,19 @@ void pt_update_sketch(gdbctx *ctx) {
   // printf("\n");
 #endif
 
-  pt_process_trace(ctx, ptbuf, trace_sz);
+  if (ctx->pt_running) {
+    GDB_PRINTF("Waiting for PT...\n", 0);
+    pthread_join(ctx->pt_thread, NULL);
+    ctx->pt_running = 0;
+  }
+
+  pt_args.ctx = ctx;
+  pt_args.buf = ptbuf;
+  pt_args.n = trace_sz;
+
+  pthread_create(&ctx->pt_thread, &pattr, pt_fork_func, &pt_args);
+  ctx->pt_running = 1;
+  // pt_process_trace(ctx, ptbuf, trace_sz);
+  // ctx->pt_running = 0;
   GDB_PRINTF("< %s\n", __FUNCTION__);
 }

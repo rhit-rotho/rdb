@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/perf_event.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 
+#include "decoder.h"
 #include "gdbstub.h"
 #include "pbvt.h"
 #include "pt.h"
@@ -35,6 +37,10 @@ void gdb_pause(gdbctx *ctx) {
   xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
   xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+  struct user_regs_struct xregs = {0};
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+  GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
   pt_update_sketch(ctx);
   gdb_disarm_timer(ctx);
 
@@ -52,10 +58,10 @@ void gdb_disarm_timer(gdbctx *ctx) {
 
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
-  arm.it_interval.tv_sec = 1;
-  arm.it_interval.tv_nsec = 0;
-  arm.it_value.tv_sec = 1;
-  arm.it_value.tv_nsec = 0;
+  arm.it_interval.tv_sec = 0;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 50;
+  arm.it_value.tv_sec = 0;
+  arm.it_value.tv_nsec = 1000 * 1000 * 50;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }
@@ -96,9 +102,16 @@ void gdb_save_state(gdbctx *ctx) {
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+  if (ctx->pt_running) {
+    GDB_PRINTF("Waiting for PT...\n", 0);
+    pthread_join(ctx->pt_thread, NULL);
+    ctx->pt_running = 0;
+  }
   pbvt_commit();
   memset(ctx->sketch.counters[0], 0x00,
          SKETCH_COL * ctx->sketch.sz * sizeof(uint64_t));
+  *ctx->insn_count = 0;
+  *ctx->bb_count = 0;
 }
 
 uint8_t gdb_checksum(char *c, size_t n) {

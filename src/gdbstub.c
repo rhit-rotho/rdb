@@ -109,7 +109,7 @@ void gdb_save_state(gdbctx *ctx) {
   }
   pbvt_commit();
   memset(ctx->sketch.counters[0], 0x00,
-         SKETCH_COL * ctx->sketch.sz * sizeof(uint64_t));
+         SKETCH_COL * ctx->sketch.sz * sizeof(ctx->sketch.counters[0][0]));
   *ctx->insn_count = 0;
   *ctx->bb_count = 0;
 }

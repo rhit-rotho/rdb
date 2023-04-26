@@ -5,8 +5,8 @@
 
 // Basic implementation of hash table with bucketing
 
-#define RHT_INITIAL_CAP (0x4000)
-#define RHT_BUCKET_CAP (16)
+#define RHT_INITIAL_CAP (64)
+#define RHT_BUCKET_CAP (128)
 
 typedef void *(*use_malloc)(size_t);
 typedef void *(*use_calloc)(size_t, size_t);
@@ -22,6 +22,7 @@ typedef struct RHashTable {
   RHashBucket *buckets;
   size_t cap; // power of 2, number of buckets
   size_t size;
+  size_t mask;
 
   use_malloc malloc;
   use_calloc calloc;

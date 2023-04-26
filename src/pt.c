@@ -85,14 +85,20 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
     dec->ip = ctx->regs->rip;
   }
 
+  ctx->t_insn_count = 0;
+  ctx->t_bb_count = 0;
+
   printf("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
   int ret = dec_decode_trace(dec, buf, n);
 
   printf("Starting PT parse...done, took %lf seconds\n", get_time() - start);
   GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d\n", dec->last_ip, ret);
 
-  GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", *ctx->insn_count,
-             *ctx->bb_count);
+  GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", ctx->t_insn_count,
+             ctx->t_bb_count);
+
+  *ctx->insn_count += ctx->t_insn_count;
+  *ctx->bb_count += ctx->t_bb_count;
 
   return 0;
 }
@@ -100,8 +106,8 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
 uint64_t empty[] = {0, 0, 0, 0};
 void basic_block_callback(void *arg, BasicBlock *bb) {
   gdbctx *ctx = arg;
-  (*ctx->bb_count)++;
-  (*ctx->insn_count) += bb->ninsns;
+  ctx->t_bb_count += 1;
+  ctx->t_insn_count += bb->ninsns;
   // We don't need any info from the basic block, so just insert the address
   if (unlikely(memcmp(bb->counters, empty, sizeof(empty)) == 0))
     for (int i = 0; i < SKETCH_COL; ++i)
@@ -231,8 +237,8 @@ void pt_update_sketch(gdbctx *ctx) {
   assert(ctx->header->aux_head == aux_head);
   ctx->header->aux_tail = aux_head;
 
-  GDB_PRINTF("Read from 0x%.6lx to 0x%.6lx (tot_size: 0x%.6lx)\n", aux_tail,
-             aux_head, ctx->header->aux_size);
+  GDB_PRINTF("Read from 0x%.6lx to 0x%.6lx (trace: 0x%.6lx, tot_size: 0x%.6lx)\n",
+             aux_tail, aux_head, trace_sz, ctx->header->aux_size);
 #ifdef PT_DEBUG
   // GDB_PRINTF("", 0);
   // for (size_t i = 0; i < trace_sz; ++i)

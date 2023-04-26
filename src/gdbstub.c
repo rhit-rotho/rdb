@@ -59,9 +59,9 @@ void gdb_disarm_timer(gdbctx *ctx) {
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
   arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 50;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 500;
   arm.it_value.tv_sec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 50;
+  arm.it_value.tv_nsec = 1000 * 1000 * 500;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }

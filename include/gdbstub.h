@@ -85,6 +85,9 @@ typedef struct gdbctx {
 
   Breakpoint bps[0x20];
   size_t bps_sz;
+
+  size_t t_insn_count;
+  size_t t_bb_count;
 } gdbctx;
 
 void sketch_init(Sketch *sketch);

@@ -20,6 +20,7 @@ RHashTable *rht_create(use_malloc tmalloc, use_calloc tcalloc, use_free tfree) {
   ht->free = tfree;
 
   ht->cap = RHT_INITIAL_CAP;
+  ht->mask = ht->cap - 1;
   ht->size = 0;
   ht->buckets = ht->calloc(ht->cap, sizeof(RHashBucket));
 
@@ -29,8 +30,9 @@ RHashTable *rht_create(use_malloc tmalloc, use_calloc tcalloc, use_free tfree) {
   return ht;
 }
 
-void *rht_get(RHashTable *ht, uint64_t key) {
-  RHashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
+__attribute__((no_stack_protector)) inline void *rht_get(RHashTable *ht,
+                                                         uint64_t key) {
+  RHashBucket *bucket = &ht->buckets[key & ht->mask];
   for (size_t i = 0; i < bucket->size; ++i)
     if (bucket->keys[i] == key) {
 #if 0
@@ -59,6 +61,7 @@ void rht_rekey(RHashTable *ht) {
   RHashTable *hn = &hnt;
   hn->size = 0;
   hn->cap = ht->cap * 2;
+  hn->mask = hn->cap - 1;
   hn->buckets = ht->calloc(hn->cap, sizeof(RHashBucket));
 
   for (size_t i = 0; i < hn->cap; ++i)
@@ -79,11 +82,10 @@ void rht_rekey(RHashTable *ht) {
 // Assumes caller does not try to insert duplicates
 int rht_insert(RHashTable *ht, uint64_t key, void *val) {
   assert(!rht_get(ht, key));
-
-  RHashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
+  RHashBucket *bucket = &ht->buckets[key & ht->mask];
   while (bucket->size + 1 >= RHT_BUCKET_CAP) {
     rht_rekey(ht);
-    bucket = &ht->buckets[key & (ht->cap - 1)];
+    bucket = &ht->buckets[key & ht->mask];
   }
 
   bucket->keys[bucket->size] = key;
@@ -95,7 +97,7 @@ int rht_insert(RHashTable *ht, uint64_t key, void *val) {
 }
 
 void *rht_remove(RHashTable *ht, uint64_t key) {
-  RHashBucket *bucket = &ht->buckets[key & (ht->cap - 1)];
+  RHashBucket *bucket = &ht->buckets[key & ht->mask];
   for (size_t i = 0; i < bucket->size; ++i) {
     if (bucket->keys[i] == key) {
       void *val = bucket->values[i];

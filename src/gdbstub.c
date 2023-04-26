@@ -248,10 +248,10 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 
   switch (buf[0]) {
   case 'c': {
-    if (!ctx->stopped)
+    if (!ctx->stopped) {
       gdb_pause(ctx);
-
-    // gdb_save_state(ctx);
+      gdb_save_state(ctx);
+    }
 
     // TODO: This mechanic only works if we call reverse-continue once, we need
     // a way to describe "already in introspection" states.
@@ -840,13 +840,39 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
   } else if (starts_with(buf, "Cont?")) {
     gdb_send_packet(ctx, "vCont;c;C;s;S");
   } else if (starts_with(buf, "Cont")) {
-    GDB_PRINTF("Assuming continue... %d\n", ctx->ppid);
-
-    gdb_save_state(ctx);
-    gdb_continue(ctx);
-
-    // TODO: Is this correct?
-    // gdb_send_empty(ctx);
+    buf += strlen("Cont;");
+    switch (*buf) {
+    case 'c':
+      GDB_PRINTF("Continue... %d\n", ctx->ppid);
+      gdb_save_state(ctx);
+      gdb_continue(ctx);
+      break;
+    case 's': {
+      int status;
+      char tmp[0x20];
+      if (!ctx->stopped) {
+        gdb_pause(ctx);
+        gdb_save_state(ctx);
+      }
+      xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      snprintf(tmp, sizeof(tmp), "S%.2x", WSTOPSIG(status));
+      gdb_send_packet(ctx, tmp);
+      break;
+    }
+    case 'C': {
+      if (!ctx->stopped) {
+        gdb_pause(ctx);
+        gdb_save_state(ctx);
+      }
+      buf += 1;
+      printf("sig: %.16lx\n", strtoull(buf, NULL, 0x10));
+      xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, strtoull(buf, NULL, 0x10));
+      break;
+    }
+    default:
+      GDB_PRINTF("UNIMPL: Cont %c\n", *buf);
+    }
   }
 }
 

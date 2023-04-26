@@ -127,6 +127,10 @@ int gdbstub(void *args) {
       continue;
     if (strstr(name, "libpbvt.so") != NULL)
       continue;
+    if (strstr(name, "libunwind") != NULL)
+      continue;
+    if (strstr(name, "liblzma") != NULL)
+      continue;
 
     // if (strcmp(name, "[heap]") == 0) {
     //   GDB_PRINTF("[heap] %s %lx-%lx\n", flags, from, to);
@@ -246,7 +250,7 @@ int gdbstub(void *args) {
       if (nbytes == 0)
         break;
       gdb_buf[nbytes] = '\0';
-      // GDB_PRINTF("Remote: \"%s\", n: %d\n", gdb_buf, nbytes);
+      GDB_PRINTF("Remote: \"%s\", n: %d\n", gdb_buf, nbytes);
       gdb_handle_packet(ctx, gdb_buf, nbytes);
       continue;
     }
@@ -267,6 +271,11 @@ int gdbstub(void *args) {
       siginfo_t si;
       xptrace(PTRACE_GETSIGINFO, ctx->ppid, 0, &si);
       GDB_PRINTF("%d %d %d\n", si.si_code, si.si_errno, si.si_signo);
+
+      if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGWINCH) {
+        xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, SIGWINCH);
+        continue;
+      }
 
       if (WSTOPSIG(status) == SIGTRAP && si.si_code == 0x80) {
         Breakpoint *bp = NULL;
@@ -317,12 +326,6 @@ int gdbstub(void *args) {
         GDB_PRINTF("Exiting syscall:\trax: 0x%.16lx\n", ctx->regs->rax);
 
         gdb_continue(ctx);
-        continue;
-      }
-
-      // ?
-      if (WSTOPSIG(status) == SIGWINCH) {
-        xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, NULL);
         continue;
       }
 

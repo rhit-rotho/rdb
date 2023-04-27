@@ -27,12 +27,21 @@ void sighandler(int signo) {
   exit(0);
 }
 
+typedef int (*func)(void);
+
+func f;
+
 int call1() { return 5; }
+
+int call3() { return 10; }
 
 int call2() {
   int result = 0;
-  result += call1();
-  result += call1();
+  for (int i = 0; i < 0x10; ++i) {
+    result += f();
+    // result += call1();
+  }
+  result += call3();
   return result;
 }
 
@@ -47,14 +56,18 @@ double get_time() {
 // generate some memory traffic
 int main(int argc, char **argv) {
 
+  f = call3;
   double start = get_time();
+  TEST_PRINTF("f: %p\n", f);
   if (argc < 2)
     asm("int3");
 
   char str[] = "hello";
-  char S[ARR_SIZE] = {0};
   UNUSED(str);
-  UNUSED(S);
+
+  call2();
+
+  // asm("int3");
 
   int other = 0;
   for (uint64_t counter_b = 0; counter_b < 0x10000; ++counter_b) {

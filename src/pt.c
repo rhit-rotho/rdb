@@ -58,26 +58,12 @@ typedef struct PTArgs {
 
 PTDecoder *dec;
 PTArgs pt_args;
-pthread_attr_t pattr;
 
 int counter = 0;
 int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   UNUSED(ctx);
 
-  // char fname[0x20];
-  // snprintf(fname, sizeof(fname), "trace%.2d.out", counter++);
-  // FILE *f = fopen(fname, "w");
-  // for (size_t i = 0; i < n; ++i) {
-  //   fprintf(f, "%c", buf[i]);
-  // }
-  // fclose(f);
-
-  // usleep(1000 * 1000 * 40);
-
   double start = get_time();
-
-  // struct user_regs_struct xregs = {0};
-  // xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
 
   // TODO: We need these to be configurable to support rewind and replay
   if (!dec->last_ip) {
@@ -185,23 +171,6 @@ int pt_init(gdbctx *ctx) {
   dec->on_bb = basic_block_callback;
   dec->on_bb_ctx = ctx;
 
-  int core = 11; // Change this to the desired core number
-
-  // Initialize thread attributes
-  pthread_attr_init(&pattr);
-
-  // Initialize CPU set
-  cpu_set_t cpuset;
-  CPU_ZERO(&cpuset);
-  CPU_SET(core, &cpuset);
-
-  // Set thread affinity
-  int result = pthread_attr_setaffinity_np(&pattr, sizeof(cpu_set_t), &cpuset);
-  if (result != 0) {
-    perror("pthread_attr_setaffinity_np");
-    exit(1);
-  }
-
   return 0;
 }
 
@@ -212,6 +181,12 @@ uint8_t ptbuf[2 * AUX_SIZE * PAGE_SIZE];
 // disabled.
 void pt_update_sketch(gdbctx *ctx) {
   GDB_PRINTF("> %s\n", __FUNCTION__);
+
+  if (ctx->pt_running) {
+    GDB_PRINTF("Waiting for PT...\n", 0);
+    pthread_join(ctx->pt_thread, NULL);
+    ctx->pt_running = 0;
+  }
 
   size_t trace_sz = 0;
 
@@ -237,20 +212,15 @@ void pt_update_sketch(gdbctx *ctx) {
   assert(ctx->header->aux_head == aux_head);
   ctx->header->aux_tail = aux_head;
 
-  GDB_PRINTF("Read from 0x%.6lx to 0x%.6lx (trace: 0x%.6lx, tot_size: 0x%.6lx)\n",
-             aux_tail, aux_head, trace_sz, ctx->header->aux_size);
+  GDB_PRINTF(
+      "Read from 0x%.6lx to 0x%.6lx (trace: 0x%.6lx, tot_size: 0x%.6lx)\n",
+      aux_tail, aux_head, trace_sz, ctx->header->aux_size);
 #ifdef PT_DEBUG
   // GDB_PRINTF("", 0);
   // for (size_t i = 0; i < trace_sz; ++i)
   //   printf("%.2x ", ptbuf[i]);
   // printf("\n");
 #endif
-
-  if (ctx->pt_running) {
-    GDB_PRINTF("Waiting for PT...\n", 0);
-    pthread_join(ctx->pt_thread, NULL);
-    ctx->pt_running = 0;
-  }
 
   pt_args.ctx = ctx;
   pt_args.buf = ptbuf;
@@ -261,4 +231,9 @@ void pt_update_sketch(gdbctx *ctx) {
   // pt_process_trace(ctx, ptbuf, trace_sz);
   // ctx->pt_running = 0;
   GDB_PRINTF("< %s\n", __FUNCTION__);
+}
+
+void pt_build_cfg(gdbctx *ctx, uint64_t addr) {
+  UNUSED(ctx);
+  dec_build_cfg("cfg.dot", dec, addr);
 }

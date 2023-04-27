@@ -47,3 +47,4 @@ typedef struct PTDecoder {
 
 int dec_init(PTDecoder *dec);
 int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n);
+void dec_build_cfg(char *name, PTDecoder *dec, uint64_t ip);

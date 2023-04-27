@@ -167,6 +167,7 @@ int gdbstub(void *args) {
 
   ctx->ppid = ppid;
   ctx->stopped = 1;
+  ctx->pt_running = 0;
   ctx->insn_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->bb_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
@@ -187,11 +188,10 @@ int gdbstub(void *args) {
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
   GDB_PRINTF("rip: %p\n", ctx->regs->rip);
 
+  pt_init(ctx);
   gdb_save_state(ctx);
   pbvt_branch_commit("head");
   pbvt_branch_commit("main");
-
-  pt_init(ctx);
 
   int gdb_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (gdb_socket < 0)
@@ -225,6 +225,7 @@ int gdbstub(void *args) {
   GDB_PRINTF("Waiting for connection from gdb on 0.0.0.0:%d...done\n", port);
 
   ctx->timerfd = timerfd_create(CLOCK_REALTIME, 0);
+  ctx->prev_snapshot = get_time();
   gdb_arm_timer(ctx);
 
   struct pollfd pollfds[3] = {0};

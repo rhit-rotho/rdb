@@ -31,7 +31,7 @@ uint8_t PT_LNG_TNT[] = {0x02, 0xa3};
 size_t PT_LNG_TNT_SZ = sizeof(PT_LNG_TNT);
 
 uint8_t PT_VMCS[] = {0x02, 0xc8};
-size_t PT_VMCS_SZ = sizeof(PT_LNG_TNT)+5;
+size_t PT_VMCS_SZ = sizeof(PT_LNG_TNT) + 5;
 
 uint8_t PT_PAD = 0x00;
 
@@ -322,7 +322,7 @@ uint8_t *dec_parse_psb(PTDecoder *dec, uint8_t *trace) {
       trace += PT_CBR_SZ;
     } else if (memcmp(trace, PT_MODE, sizeof(PT_MODE)) == 0) {
       trace += PT_MODE_SZ;
-    } else if(memcmp(trace, PT_VMCS, sizeof(PT_VMCS))==0) {
+    } else if (memcmp(trace, PT_VMCS, sizeof(PT_VMCS)) == 0) {
       // TODO: Handle optional on PSB+ (32.4.2.15)
       trace += PT_VMCS_SZ;
     } else if ((trace[0] & 0b11111) == 0b11101) { // FUP
@@ -346,8 +346,8 @@ void dec_build_cfg_node(FILE *f, PTDecoder *dec, uint64_t ip) {
   if (!bb) {
     bb = dec_get_bb(dec, ip);
     fprintf(f, "v%.16lx [\n", ip);
-    fprintf(f, "		label = \"{%.12lx %s|{<0>x|<1>x}}\";\n", ip,
-            BB_TYPES[bb->type]);
+    fprintf(f, "		label = \"{%.12lx %s (%ld insns)|(uncalled)}\";\n",
+            ip, BB_TYPES[bb->type], bb->ninsns);
     fprintf(f, "];\n");
     rht_insert(processed, ip, (void *)ip);
 
@@ -388,12 +388,24 @@ void dec_build_cfg_node(FILE *f, PTDecoder *dec, uint64_t ip) {
     dec_build_cfg_node(f, dec, bb->out[1]);
     break;
   case BB_CALL:
-    fprintf(f, "{<0>x}}\";\n");
+    fprintf(f, "{<0>ret|<1>branch}}\";\n");
     fprintf(f, "];\n");
+    fprintf(f, "v%.16lx:0 -> v%.16lx:n\n", ip, bb->end);
+    fprintf(f, "v%.16lx:1 -> v%.16lx:n\n", ip, bb->out[0]);
+    dec_build_cfg_node(f, dec, bb->end);
+    dec_build_cfg_node(f, dec, bb->out[0]);
+    break;
+  case BB_INDIRECT_CALL:
+    fprintf(f, "{<0>ret|<1>branch (unknown)}}\";\n");
+    fprintf(f, "];\n");
+
+    // We don't record all possible branch targets for an indirect call, so...
     fprintf(f, "v%.16lx:0 -> v%.16lx:n\n", ip, bb->end);
     dec_build_cfg_node(f, dec, bb->end);
     break;
   case BB_RET:
+    fprintf(f, "{<0>target (unknown)}}\";\n");
+    fprintf(f, "];\n");
     break;
   default:
     printf("Unhandled %d.\n", bb->type);

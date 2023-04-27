@@ -59,9 +59,9 @@ void gdb_disarm_timer(gdbctx *ctx) {
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
   arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 500;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 50;
   arm.it_value.tv_sec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 500;
+  arm.it_value.tv_nsec = 1000 * 1000 * 50;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }
@@ -97,7 +97,7 @@ void gdb_continue(gdbctx *ctx) {
 }
 
 void gdb_save_state(gdbctx *ctx) {
-  // ctx->sketch is saved automatically :)
+  xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
   ctx->regs->rax = 0;
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
@@ -107,6 +107,13 @@ void gdb_save_state(gdbctx *ctx) {
     pthread_join(ctx->pt_thread, NULL);
     ctx->pt_running = 0;
   }
+  struct user_regs_struct xregs = {0};
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+  GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
+
+  // ctx->sketch is saved automatically as part of commit :)
+  pt_update_sketch(ctx);
+
   pbvt_commit();
   memset(ctx->sketch.counters[0], 0x00,
          SKETCH_COL * ctx->sketch.sz * sizeof(ctx->sketch.counters[0][0]));
@@ -224,15 +231,15 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     return gdb_handle_s_commands(ctx, buf, n);
   case 'v':
     return gdb_handle_v_commands(ctx, buf, n);
+  case 'Z':
+    return gdb_handle_z_add_commands(ctx, buf, n);
+  case 'z':
+    return gdb_handle_z_del_commands(ctx, buf, n);
   case 'C':
   case 'k':
   case 'F':
   case 'G':
   case 'p':
-  case 'Z':
-    return gdb_handle_z_add_commands(ctx, buf, n);
-  case 'z':
-    return gdb_handle_z_del_commands(ctx, buf, n);
   case 'T':
   case 'Q':
   default:
@@ -240,6 +247,40 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     gdb_send_empty(ctx);
     break;
   }
+}
+
+int hex_to_int(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  } else if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  } else if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  } else {
+    return -1;
+  }
+}
+
+size_t hex_decode(char *hex, char *output, size_t n) {
+  size_t input_len = n;
+  if (input_len % 2 != 0) {
+    return 0; // Invalid input length
+  }
+
+  size_t decoded_len = input_len / 2;
+
+  for (size_t i = 0; i < input_len; i += 2) {
+    int high_nibble = hex_to_int(hex[i]);
+    int low_nibble = hex_to_int(hex[i + 1]);
+
+    if (high_nibble == -1 || low_nibble == -1) {
+      return 0; // Invalid hex character
+    }
+
+    output[i / 2] = (high_nibble << 4) | low_nibble;
+  }
+
+  return decoded_len;
 }
 
 // Handle backwards commands
@@ -253,8 +294,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
       gdb_save_state(ctx);
     }
 
-    // TODO: This mechanic only works if we call reverse-continue once, we need
-    // a way to describe "already in introspection" states.
+    // TODO: This mechanic only works if we call reverse-continue once, we
+    // need a way to describe "already in introspection" states.
 
     Commit *c = pbvt_head();
     Breakpoint *bp = NULL;
@@ -619,7 +660,23 @@ void gdb_handle_p_set_commands(gdbctx *ctx, char *buf, size_t n) {
 void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
   char *endptr = buf + n;
 
-  if (starts_with(buf, "Supported")) {
+  if (starts_with(buf, "Rcmd")) {
+    buf += strlen("Rcmd,");
+
+    char decoded[0x40];
+    char *p = decoded;
+    hex_decode(buf, decoded, MIN(sizeof(decoded), n - 8));
+
+    if (starts_with(p, "PTCFG")) {
+      p += strlen("PTCFG:");
+      char *endptr = p + n;
+      p += strlen("0x"); // TODO: Check
+      uint64_t addr = strtoull(p, &endptr, 0x10);
+      printf("ptdecode: %.16lx\n", addr);
+      pt_build_cfg(ctx, addr);
+      gdb_send_packet(ctx, "6366672e646f74"); // 'cfg.dot'
+    }
+  } else if (starts_with(buf, "Supported")) {
     gdb_send_packet(ctx, "PacketSize=47ff;ReverseStep+;ReverseContinue+;qXfer:"
                          "exec-file:read+;qXfer:features:read+;qXfer:libraries-"
                          "svr4:read+;qXfer:auxv:read+;swbreak+;multiprocess+");

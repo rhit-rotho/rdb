@@ -226,10 +226,10 @@ void pt_update_sketch(gdbctx *ctx) {
   pt_args.buf = ptbuf;
   pt_args.n = trace_sz;
 
-  pthread_create(&ctx->pt_thread, &pattr, pt_fork_func, &pt_args);
+  // pthread_create(&ctx->pt_thread, NULL, pt_fork_func, &pt_args);
   ctx->pt_running = 1;
-  // pt_process_trace(ctx, ptbuf, trace_sz);
-  // ctx->pt_running = 0;
+  pt_process_trace(ctx, ptbuf, trace_sz);
+  ctx->pt_running = 0;
   GDB_PRINTF("< %s\n", __FUNCTION__);
 }
 

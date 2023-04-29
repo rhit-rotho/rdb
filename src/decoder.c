@@ -81,11 +81,13 @@ bool is_control_flow_insn(cs_insn *insn) {
 }
 
 BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
+  assert(sip);
   // printf("----\n");
 
   BasicBlock *bb = rht_get(bb_cache, sip);
   if (bb) {
-    dec->on_bb(dec->on_bb_ctx, bb);
+    if (dec->on_bb)
+      dec->on_bb(dec->on_bb_ctx, bb);
     // printf("BB 0x%.16lx:\n", bb->start);
     return bb;
   }
@@ -164,7 +166,8 @@ BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
       bb->ninsns = ninsns;
       bb->out[0] = ip + tinsn->size;
       rht_insert(bb_cache, bb->start, bb);
-      dec->on_bb(dec->on_bb_ctx, bb);
+      if (dec->on_bb)
+        dec->on_bb(dec->on_bb_ctx, bb);
       return bb;
     }
 
@@ -231,7 +234,8 @@ BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
   }
 
   rht_insert(bb_cache, bb->start, bb);
-  dec->on_bb(dec->on_bb_ctx, bb);
+  if (dec->on_bb)
+    dec->on_bb(dec->on_bb_ctx, bb);
   return bb;
 }
 
@@ -258,6 +262,7 @@ BasicBlock *dec_transition_to_next_conditional(PTDecoder *dec, uint64_t sip) {
       bb = dec_get_bb(dec, dec->bind_targets[dec->bpos_r]);
       dec->bpos_r = (dec->bpos_r + 1 + BPOS_SZ) % BPOS_SZ;
     } else if (bb->type == BB_INDIRECT_CALL) {
+      assert(dec->bind_targets[dec->bpos_r]);
       bb = dec_get_bb(dec, dec->bind_targets[dec->bpos_r]);
       dec->bpos_r = (dec->bpos_r + 1 + BPOS_SZ) % BPOS_SZ;
     } else {
@@ -276,7 +281,7 @@ uint64_t dec_not_taken(PTDecoder *dec, uint64_t sip) {
   return dec_transition_to_next_conditional(dec, sip)->out[1];
 }
 
-inline static uint64_t dec_get_target_ip(uint8_t **trace, uint64_t ip) {
+static inline uint64_t dec_get_target_ip(uint8_t **trace, uint64_t ip) {
   uint8_t *tp = *trace;
   uint8_t kind = (tp[0] >> 5) & 7;
   uint64_t tip = *(uint64_t *)&tp[1];
@@ -346,8 +351,9 @@ void dec_build_cfg_node(FILE *f, PTDecoder *dec, uint64_t ip) {
   if (!bb) {
     bb = dec_get_bb(dec, ip);
     fprintf(f, "v%.16lx [\n", ip);
-    fprintf(f, "		label = \"{%.12lx %s (%ld insns)|(uncalled)}\";\n",
-            ip, BB_TYPES[bb->type], bb->ninsns);
+    fprintf(f,
+            "		label = \"{%.12lx %s (%ld insns)|(uncalled)}\";\n", ip,
+            BB_TYPES[bb->type], bb->ninsns);
     fprintf(f, "];\n");
     rht_insert(processed, ip, (void *)ip);
 
@@ -428,14 +434,47 @@ int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n) {
   uint8_t *trace = buf;
   while (trace < buf + n) {
     if (*trace == PT_PAD) {
-      trace += 1;
-    } else if (memcmp(trace, PT_MODE, sizeof(PT_MODE)) == 0) {
-      trace += PT_MODE_SZ;
-    } else if (memcmp(trace, PT_CBR, sizeof(PT_CBR)) == 0) {
-      trace += PT_CBR_SZ;
+      while (*trace == PT_PAD)
+        trace += 1;
     } else if (memcmp(trace, PT_PSB, sizeof(PT_PSB)) == 0) {
       trace += PT_PSB_SZ;
       trace = dec_parse_psb(dec, trace);
+    } else if (memcmp(trace, PT_CBR, sizeof(PT_CBR)) == 0) {
+      trace += PT_CBR_SZ;
+    } else if (memcmp(trace, PT_MODE, sizeof(PT_MODE)) == 0) {
+      trace += PT_MODE_SZ;
+    } else if ((trace[0] & 0b1) == 0b0) { // Short TNT
+      // printf("sTNT\n");
+      // hexdump(trace, 0x8);
+      uint8_t branches = trace[0];
+      uint8_t cnt = 6;
+
+      // Find stop bit
+      while ((branches & 0b10000000) == 0) {
+        branches <<= 1;
+        cnt -= 1;
+      }
+      branches <<= 1;
+
+      for (int i = 0; i < cnt; ++i, branches <<= 1)
+        if ((branches & (1ull << 7)) == 0)
+          dec->ip = dec_not_taken(dec, dec->ip);
+        else
+          dec->ip = dec_taken(dec, dec->ip);
+
+      trace += 1;
+    } else if ((trace[0] & 0b11111) == 0b10001) { // TIP.PGE
+      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
+    } else if ((trace[0] & 0b11111) == 0b00001) { // TIP.PGD
+      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
+    } else if ((trace[0] & 0b11111) == 0b01101) { // TIP
+      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
+      dec->bind_targets[dec->bpos_w] = dec->last_ip;
+      // printf("TIP: %.16lx\n", dec->last_ip);
+      // hexdump(trace, 0x8);
+      dec->bpos_w = (dec->bpos_w + 1 + BPOS_SZ) % BPOS_SZ;
+    } else if ((trace[0] & 0b11111) == 0b11101) { // FUP
+      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
     } else if (memcmp(trace, PT_LNG_TNT, sizeof(PT_LNG_TNT)) == 0) {
       printf("IMPL: PT_LNG_TNT\n");
       abort();
@@ -456,34 +495,6 @@ int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n) {
         else
           dec->ip = dec_taken(dec, dec->ip);
       trace += 8;
-    } else if ((trace[0] & 0b11111) == 0b10001) { // TIP.PGE
-      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
-    } else if ((trace[0] & 0b11111) == 0b00001) { // TIP.PGD
-      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
-    } else if ((trace[0] & 0b11111) == 0b01101) { // TIP
-      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
-      dec->bind_targets[dec->bpos_w] = dec->last_ip;
-      dec->bpos_w = (dec->bpos_w + 1 + BPOS_SZ) % BPOS_SZ;
-    } else if ((trace[0] & 0b11111) == 0b11101) { // FUP
-      dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
-    } else if ((trace[0] & 0b1) == 0b0) { // Short TNT
-      uint8_t branches = trace[0];
-      uint8_t cnt = 6;
-
-      // Find stop bit
-      while ((branches & 0b10000000) == 0) {
-        branches <<= 1;
-        cnt -= 1;
-      }
-      branches <<= 1;
-
-      for (int i = 0; i < cnt; ++i, branches <<= 1)
-        if ((branches & (1ull << 7)) == 0)
-          dec->ip = dec_not_taken(dec, dec->ip);
-        else
-          dec->ip = dec_taken(dec, dec->ip);
-
-      trace += 1;
     } else {
       printf("Unrecognized packet! Context (%ld read, %ld bytes "
              "remaining): \n",

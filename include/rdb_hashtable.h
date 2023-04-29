@@ -6,7 +6,7 @@
 // Basic implementation of hash table with bucketing
 
 #define RHT_INITIAL_CAP (64)
-#define RHT_BUCKET_CAP (128)
+#define RHT_BUCKET_CAP (32)
 
 typedef void *(*use_malloc)(size_t);
 typedef void *(*use_calloc)(size_t, size_t);

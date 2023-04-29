@@ -30,28 +30,21 @@ RHashTable *rht_create(use_malloc tmalloc, use_calloc tcalloc, use_free tfree) {
   return ht;
 }
 
-__attribute__((no_stack_protector)) inline void *rht_get(RHashTable *ht,
-                                                         uint64_t key) {
+__attribute__((no_stack_protector)) __attribute__((hot)) inline void *
+rht_get(RHashTable *ht, uint64_t key) {
   RHashBucket *bucket = &ht->buckets[key & ht->mask];
   for (size_t i = 0; i < bucket->size; ++i)
     if (bucket->keys[i] == key) {
-#if 0
-      if (unlikely(i > 0)) {
-        uint64_t temp_key;
-        void *temp_value;
-        memcpy(&temp_key, &bucket->keys[i], sizeof(temp_key));
-        memcpy(&temp_value, &bucket->values[i], sizeof(temp_value));
+      uint64_t key = bucket->keys[i];
+      void *value = bucket->values[i];
+      if (i > 4) {
+        bucket->keys[i] = bucket->keys[0];
+        bucket->values[i] = bucket->values[0];
 
-        memcpy(&bucket->keys[i], &bucket->keys[0], sizeof(temp_key));
-        memcpy(&bucket->values[i], &bucket->values[0], sizeof(temp_value));
-
-        memcpy(&bucket->keys[0], &temp_key, sizeof(temp_key));
-        memcpy(&bucket->values[0], &temp_value, sizeof(temp_value));
+        bucket->keys[0] = key;
+        bucket->values[0] = value;
       }
-      return bucket->values[0];
-#else
-      return bucket->values[i];
-#endif
+      return value;
     }
   return NULL;
 }

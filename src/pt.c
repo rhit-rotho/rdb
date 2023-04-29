@@ -19,10 +19,9 @@
 #include "fasthash.h"
 #include "mmap_malloc.h"
 #include "pt.h"
-#include "rdb_hashtable.h"
 
 // #define PT_DEBUG
-#define AUX_SIZE (256)
+#define AUX_SIZE (1024)
 
 __attribute__((hot)) inline void hit_count_inc(Sketch *sketch, uint64_t ip) {
   for (int i = 0; i < SKETCH_COL; ++i)
@@ -74,10 +73,11 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   ctx->t_insn_count = 0;
   ctx->t_bb_count = 0;
 
-  printf("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
+  GDB_PRINTF("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
   int ret = dec_decode_trace(dec, buf, n);
 
-  printf("Starting PT parse...done, took %lf seconds\n", get_time() - start);
+  GDB_PRINTF("Starting PT parse...done, took %lf seconds\n",
+             get_time() - start);
   GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d\n", dec->last_ip, ret);
 
   GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", ctx->t_insn_count,
@@ -224,12 +224,28 @@ void pt_update_sketch(gdbctx *ctx) {
 
   pt_args.ctx = ctx;
   pt_args.buf = ptbuf;
+  ptbuf[trace_sz] = 0x55;
   pt_args.n = trace_sz;
 
-  // pthread_create(&ctx->pt_thread, NULL, pt_fork_func, &pt_args);
+  pthread_attr_t pattr;
+  pthread_attr_init(&pattr);
+
+  int target_core = 0; // Set the target core number here (e.g., core 1)
+  cpu_set_t cpuset;
+
+  // Set the CPU affinity for the thread
+  CPU_ZERO(&cpuset);
+  CPU_SET(target_core, &cpuset);
+
+  if (pthread_attr_setaffinity_np(&pattr, sizeof(cpu_set_t), &cpuset)) {
+    perror("pthread_setaffinity_np");
+    exit(1);
+  }
+
+  pthread_create(&ctx->pt_thread, &pattr, pt_fork_func, &pt_args);
   ctx->pt_running = 1;
-  pt_process_trace(ctx, ptbuf, trace_sz);
-  ctx->pt_running = 0;
+  // pt_process_trace(ctx, ptbuf, trace_sz);
+  // ctx->pt_running = 0;
   GDB_PRINTF("< %s\n", __FUNCTION__);
 }
 

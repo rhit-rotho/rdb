@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/perf_event.h>
@@ -12,6 +11,7 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 
+#include "cassert.h"
 #include "decoder.h"
 #include "gdbstub.h"
 #include "pbvt.h"

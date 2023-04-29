@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <capstone/capstone.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -8,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "cassert.h"
 #include "decoder.h"
 #include "rdb_hashtable.h"
 

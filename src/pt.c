@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#include <assert.h>
 #include <capstone/capstone.h>
 #include <linux/perf_event.h>
 #include <pthread.h>
@@ -15,6 +14,7 @@
 #include <sys/user.h>
 #include <time.h>
 
+#include "cassert.h"
 #include "decoder.h"
 #include "fasthash.h"
 #include "mmap_malloc.h"

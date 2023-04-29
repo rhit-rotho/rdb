@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
-#include <assert.h>
 #include <capstone/capstone.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -22,6 +21,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "cassert.h"
 #include "gdbstub.h"
 #include "pbvt.h"
 #include "pt.h"

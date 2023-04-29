@@ -1,8 +1,8 @@
 // TODO: Refactor this into libpbvt implementation
 
-#include <assert.h>
 #include <string.h>
 
+#include "cassert.h"
 #include "mmap_malloc.h"
 #include "rdb_hashtable.h"
 

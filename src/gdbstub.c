@@ -675,6 +675,9 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
       printf("ptdecode: %.16lx\n", addr);
       pt_build_cfg(ctx, addr);
       gdb_send_packet(ctx, "6366672e646f74"); // 'cfg.dot'
+    } else if (starts_with(p, "PBVTSTATS")) {
+      pbvt_stats();
+      gdb_send_packet(ctx, "4f4b"); // 'OK'
     }
   } else if (starts_with(buf, "Supported")) {
     gdb_send_packet(ctx, "PacketSize=47ff;ReverseStep+;ReverseContinue+;qXfer:"

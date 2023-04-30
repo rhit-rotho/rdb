@@ -24,28 +24,14 @@ RHashTable *rht_create(use_malloc tmalloc, use_calloc tcalloc, use_free tfree) {
   ht->size = 0;
   ht->buckets = ht->calloc(ht->cap, sizeof(RHashBucket));
 
-  for (size_t i = 0; i < ht->cap; ++i)
-    ht->buckets[i].size = 0;
-
   return ht;
 }
 
-__attribute__((no_stack_protector)) __attribute__((hot)) inline void *
-rht_get(RHashTable *ht, uint64_t key) {
+void *rht_get(RHashTable *ht, uint64_t key) {
   RHashBucket *bucket = &ht->buckets[key & ht->mask];
   for (size_t i = 0; i < bucket->size; ++i)
-    if (bucket->keys[i] == key) {
-      uint64_t key = bucket->keys[i];
-      void *value = bucket->values[i];
-      if (i > 4) {
-        bucket->keys[i] = bucket->keys[0];
-        bucket->values[i] = bucket->values[0];
-
-        bucket->keys[0] = key;
-        bucket->values[0] = value;
-      }
-      return value;
-    }
+    if (bucket->keys[i] == key)
+      return bucket->values[i];
   return NULL;
 }
 
@@ -56,9 +42,6 @@ void rht_rekey(RHashTable *ht) {
   hn->cap = ht->cap * 2;
   hn->mask = hn->cap - 1;
   hn->buckets = ht->calloc(hn->cap, sizeof(RHashBucket));
-
-  for (size_t i = 0; i < hn->cap; ++i)
-    hn->buckets[i].size = 0;
 
   // reinsert
   for (size_t i = 0; i < ht->cap; ++i) {

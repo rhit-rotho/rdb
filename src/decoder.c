@@ -1,5 +1,7 @@
+#define _GNU_SOURCE
 #include <capstone/capstone.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -50,7 +52,7 @@ void hexdump(void *buf, size_t n) {
   printf("\n");
 }
 
-inline static uint64_t sext(uint64_t val, uint8_t sign) {
+uint64_t sext(uint64_t val, uint8_t sign) {
   uint64_t signbit, mask;
 
   signbit = 1ull << (sign - 1);
@@ -80,23 +82,14 @@ bool is_control_flow_insn(cs_insn *insn) {
   }
 }
 
-BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
-  assert(sip);
-  // printf("----\n");
+#define likely(x) __builtin_expect(x, 1)
+#define unlikely(x) __builtin_expect(x, 0)
 
-  BasicBlock *bb = rht_get(bb_cache, sip);
+BasicBlock *dec_get_bb_uncached(PTDecoder *dec, uint64_t sip) {
+  // Does our IP already belong to an existing BB? It can't be the start of a
+  // basic block, since that would have already been handled by our caller.
+  BasicBlock *bb = rht_get(bb_insn, sip);
   if (bb) {
-    if (dec->on_bb)
-      dec->on_bb(dec->on_bb_ctx, bb);
-    // printf("BB 0x%.16lx:\n", bb->start);
-    return bb;
-  }
-
-  if (rht_get(bb_insn, sip)) {
-    printf("UNIMPL: About to split!\n");
-    abort();
-
-    BasicBlock *bb = rht_get(bb_insn, sip);
     BasicBlock *nb = calloc(1, sizeof(BasicBlock));
 
     uint64_t ip = bb->start;
@@ -117,13 +110,15 @@ BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
     nb->end = bb->end;
     nb->out[0] = bb->out[0];
     nb->out[1] = bb->out[1];
+    nb->out_bb[0] = bb->out_bb[0];
+    nb->out_bb[1] = bb->out_bb[1];
     nb->type = bb->type;
 
     bb->type = BB_UNCONDITIONAL_JMP;
     bb->ninsns -= nb->ninsns;
     bb->end = sip;
     bb->out[0] = nb->start;
-    bb->out[1] = nb->start;
+    bb->out_bb[0] = nb;
 
     printf("Split block! %.16lx-%.16lx & %.16lx-%.16lx\n", bb->start, sip, sip,
            nb->end);
@@ -234,25 +229,45 @@ BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
   }
 
   rht_insert(bb_cache, bb->start, bb);
-  if (dec->on_bb)
-    dec->on_bb(dec->on_bb_ctx, bb);
+  // if (dec->on_bb)
+  //   dec->on_bb(dec->on_bb_ctx, bb);
   return bb;
 }
 
-BasicBlock *dec_transition_to_next_conditional(PTDecoder *dec, uint64_t sip) {
-  BasicBlock *bb = dec_get_bb(dec, sip);
+BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip) {
+  assert(sip);
+
+  BasicBlock *bb = rht_get(bb_cache, sip);
+  if (likely(bb != NULL)) {
+    // if (dec->on_bb)
+    //   dec->on_bb(dec->on_bb_ctx, bb);
+    // printf("BB 0x%.16lx:\n", bb->start);
+    return bb;
+  }
+
+  return dec_get_bb_uncached(dec, sip);
+}
+
+BasicBlock *dec_transition_to_next_conditional(PTDecoder *dec, BasicBlock *bb) {
   for (;;) {
-    if (bb->type == BB_CONDITIONAL_JMP) {
+    switch (bb->type) {
+    case BB_UNCONDITIONAL_JMP:
+      if (unlikely(bb->out_bb[0] == NULL))
+        bb->out_bb[0] = dec_get_bb(dec, bb->out[0]);
+      bb = bb->out_bb[0];
       break;
-    } else if (bb->type == BB_UNCONDITIONAL_JMP) {
-      bb = dec_get_bb(dec, bb->out[0]);
-    } else if (bb->type == BB_CALL) {
+    case BB_CONDITIONAL_JMP:
+      return bb;
+    case BB_CALL:
       // TODO: Compressed RET
       // callstack[cpos] = bb->end;
       // printf(">> %ld: 0x%.16lx\n", cpos, callstack[cpos]);
       // cpos = (cpos + CALLSTACK_SZ + 1) % CALLSTACK_SZ;
-      bb = dec_get_bb(dec, bb->out[0]);
-    } else if (bb->type == BB_RET) {
+      if (unlikely(bb->out_bb[0] == NULL))
+        bb->out_bb[0] = dec_get_bb(dec, bb->out[0]);
+      bb = bb->out_bb[0];
+      break;
+    case BB_RET:
       // TODO: Compressed RET
       // cpos = (cpos + CALLSTACK_SZ - 1) % CALLSTACK_SZ;
       // printf("<< %ld: 0x%.16lx\n", cpos, callstack[cpos]);
@@ -261,24 +276,33 @@ BasicBlock *dec_transition_to_next_conditional(PTDecoder *dec, uint64_t sip) {
       // return bb;
       bb = dec_get_bb(dec, dec->bind_targets[dec->bpos_r]);
       dec->bpos_r = (dec->bpos_r + 1 + BPOS_SZ) % BPOS_SZ;
-    } else if (bb->type == BB_INDIRECT_CALL) {
+      break;
+    case BB_INDIRECT_CALL:
       assert(dec->bind_targets[dec->bpos_r]);
       bb = dec_get_bb(dec, dec->bind_targets[dec->bpos_r]);
       dec->bpos_r = (dec->bpos_r + 1 + BPOS_SZ) % BPOS_SZ;
-    } else {
-      printf("Unhandled bb type! %d\n", bb->type);
-      abort();
+      break;
+    default:
+      // printf("Unhandled bb type! %d\n", bb->type);
+      // abort();
+      __builtin_unreachable();
     }
   }
   return bb;
 }
 
-uint64_t dec_taken(PTDecoder *dec, uint64_t sip) {
-  return dec_transition_to_next_conditional(dec, sip)->out[0];
+static inline BasicBlock *dec_taken(PTDecoder *dec, BasicBlock *bb) {
+  BasicBlock *tbb = dec_transition_to_next_conditional(dec, bb);
+  if (unlikely(tbb->out_bb[0] == NULL))
+    tbb->out_bb[0] = dec_get_bb(dec, tbb->out[0]);
+  return tbb->out_bb[0];
 }
 
-uint64_t dec_not_taken(PTDecoder *dec, uint64_t sip) {
-  return dec_transition_to_next_conditional(dec, sip)->out[1];
+static inline BasicBlock *dec_not_taken(PTDecoder *dec, BasicBlock *bb) {
+  BasicBlock *tbb = dec_transition_to_next_conditional(dec, bb);
+  if (unlikely(tbb->out_bb[1] == NULL))
+    tbb->out_bb[1] = dec_get_bb(dec, tbb->out[1]);
+  return tbb->out_bb[1];
 }
 
 static inline uint64_t dec_get_target_ip(uint8_t **trace, uint64_t ip) {
@@ -310,8 +334,7 @@ static inline uint64_t dec_get_target_ip(uint8_t **trace, uint64_t ip) {
   // case 0b111: // Reserved
   //   break;
   default:
-    printf("No match!\n");
-    return 0;
+    __builtin_unreachable();
   }
   return ip;
 }
@@ -430,37 +453,66 @@ void dec_build_cfg(char *name, PTDecoder *dec, uint64_t ip) {
   rht_free(processed);
 }
 
+uint8_t *dec_sync_next(PTDecoder *dec, uint8_t *trace, size_t n) {
+  uint8_t *next = memmem(trace, n, PT_PSB, sizeof(PT_PSB));
+  if (next == NULL)
+    return trace;
+
+  trace = next;
+  trace += PT_PSB_SZ;
+  trace = dec_parse_psb(dec, trace);
+  dec->ip = dec->last_ip;
+
+  return trace;
+}
+
 int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n) {
   uint8_t *trace = buf;
-  while (trace < buf + n) {
+  dec->current_bb = dec_get_bb(dec, dec->ip);
+
+  for (;;) {
     if (*trace == PT_PAD) {
-      while (*trace == PT_PAD)
-        trace += 1;
-    } else if (memcmp(trace, PT_PSB, sizeof(PT_PSB)) == 0) {
+      trace += 1;
+    } else if (unlikely(*(uint32_t *)trace == 0x82028202) &&
+               memcmp(trace, PT_PSB, sizeof(PT_PSB)) == 0) {
       trace += PT_PSB_SZ;
       trace = dec_parse_psb(dec, trace);
-    } else if (memcmp(trace, PT_CBR, sizeof(PT_CBR)) == 0) {
+    } else if (*(uint16_t *)trace == 0x0302) {
       trace += PT_CBR_SZ;
-    } else if (memcmp(trace, PT_MODE, sizeof(PT_MODE)) == 0) {
-      trace += PT_MODE_SZ;
-    } else if ((trace[0] & 0b1) == 0b0) { // Short TNT
+    } else if (likely((*trace & 0b1) == 0b0)) { // Short TNT
       // printf("sTNT\n");
       // hexdump(trace, 0x8);
       uint8_t branches = trace[0];
       uint8_t cnt = 6;
 
       // Find stop bit
-      while ((branches & 0b10000000) == 0) {
+      while (unlikely((branches & 0b10000000) == 0)) {
         branches <<= 1;
         cnt -= 1;
       }
       branches <<= 1;
 
-      for (int i = 0; i < cnt; ++i, branches <<= 1)
-        if ((branches & (1ull << 7)) == 0)
-          dec->ip = dec_not_taken(dec, dec->ip);
-        else
-          dec->ip = dec_taken(dec, dec->ip);
+      // TODO: Cleanup
+      if (cnt == 6) {
+        uint8_t hst = branches >> 2;
+        if (dec->current_bb->tbl[hst] != NULL) {
+          dec->current_bb = dec->current_bb->tbl[hst];
+        } else {
+          BasicBlock *orig = dec->current_bb;
+          for (int i = 0; i < cnt; ++i, branches <<= 1)
+            if ((branches & (1ull << 7)) == 0)
+              dec->current_bb = dec_not_taken(dec, dec->current_bb);
+            else
+              dec->current_bb = dec_taken(dec, dec->current_bb);
+          orig->tbl[hst] = dec->current_bb;
+        }
+      } else {
+        for (int i = 0; i < cnt; ++i, branches <<= 1)
+          if ((branches & (1ull << 7)) == 0)
+            dec->current_bb = dec_not_taken(dec, dec->current_bb);
+          else
+            dec->current_bb = dec_taken(dec, dec->current_bb);
+      }
 
       trace += 1;
     } else if ((trace[0] & 0b11111) == 0b10001) { // TIP.PGE
@@ -475,6 +527,10 @@ int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n) {
       dec->bpos_w = (dec->bpos_w + 1 + BPOS_SZ) % BPOS_SZ;
     } else if ((trace[0] & 0b11111) == 0b11101) { // FUP
       dec->last_ip = dec_get_target_ip(&trace, dec->last_ip);
+    } else if (trace[0] == PT_MODE[0]) {
+      trace += PT_MODE_SZ;
+    } else if (*trace == 0x55) {
+      break;
     } else if (memcmp(trace, PT_LNG_TNT, sizeof(PT_LNG_TNT)) == 0) {
       printf("IMPL: PT_LNG_TNT\n");
       abort();
@@ -491,9 +547,9 @@ int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n) {
       // printf("branches: %.16lx %d\n", branches, cnt);
       for (size_t i = 0; i < cnt; ++i, branches <<= 1)
         if ((branches & (1ull << 63)) == 0)
-          dec->ip = dec_not_taken(dec, dec->ip);
+          dec->current_bb = dec_not_taken(dec, dec->current_bb);
         else
-          dec->ip = dec_taken(dec, dec->ip);
+          dec->current_bb = dec_taken(dec, dec->current_bb);
       trace += 8;
     } else {
       printf("Unrecognized packet! Context (%ld read, %ld bytes "
@@ -505,6 +561,10 @@ int dec_decode_trace(PTDecoder *dec, uint8_t *buf, size_t n) {
       return -1;
     }
   }
+
+  // TODO: Transition to end of current basic block before snapshotting
+  dec->last_ip = dec->current_bb->start;
+  dec->ip = dec->current_bb->end;
   return 0;
 }
 
@@ -524,6 +584,8 @@ int dec_init(PTDecoder *dec) {
   if (!tinsn)
     tinsn = cs_malloc(handle);
 
-  dec->bpos_r = dec->bpos_w;
+  dec->bpos_w = 0;
+  dec->bpos_r = 0;
+
   return 0;
 }

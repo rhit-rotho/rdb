@@ -18,27 +18,11 @@
 #include "decoder.h"
 #include "fasthash.h"
 #include "mmap_malloc.h"
+#include "pbvt.h"
 #include "pt.h"
 
 // #define PT_DEBUG
 #define AUX_SIZE (1024)
-
-__attribute__((hot)) inline void hit_count_inc(Sketch *sketch, uint64_t ip) {
-  for (int i = 0; i < SKETCH_COL; ++i)
-    sketch->counters[i][fasthash64(&ip, sizeof(ip), i) & sketch->mask]++;
-}
-
-__attribute__((hot)) inline uint64_t hit_count_get(Sketch *sketch,
-                                                   uint64_t ip) {
-  uint64_t cnt =
-      sketch->counters[0][fasthash64(&ip, sizeof(ip), 0) & sketch->mask];
-  for (int i = 1; i < SKETCH_COL; ++i) {
-    cnt =
-        MIN(cnt,
-            sketch->counters[i][fasthash64(&ip, sizeof(ip), i) & sketch->mask]);
-  }
-  return cnt;
-}
 
 #define likely(x) __builtin_expect(x, 1)
 #define unlikely(x) __builtin_expect(x, 0)
@@ -62,26 +46,28 @@ int counter = 0;
 int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   UNUSED(ctx);
 
-  double start = get_time();
+  // char path[0x100];
+  // snprintf(path, sizeof(path), "traces/trace%.2d.out", counter++);
+  // printf("%s: 0x%.16lx\n", path, ctx->regs->rip);
+  // FILE *f = fopen(path, "w");
+  // fwrite(buf, sizeof(buf[0]), n, f);
+  // fclose(f);
 
-  // TODO: We need these to be configurable to support rewind and replay
-  if (!dec->last_ip) {
-    dec->last_ip = ctx->regs->rip;
-    dec->ip = ctx->regs->rip;
-  }
+  double start = get_time();
 
   ctx->t_insn_count = 0;
   ctx->t_bb_count = 0;
 
-  GDB_PRINTF("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
+  // GDB_PRINTF("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
   int ret = dec_decode_trace(dec, buf, n);
 
-  GDB_PRINTF("Starting PT parse...done, took %lf seconds\n",
-             get_time() - start);
-  GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d\n", dec->last_ip, ret);
+  // GDB_PRINTF("Starting PT parse...done, took %lf seconds\n",
+  //            get_time() - start);
+  // GDB_PRINTF("Final ip from decode: 0x%.16lx, status: %d\n", dec->last_ip,
+  // ret);
 
-  GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", ctx->t_insn_count,
-             ctx->t_bb_count);
+  // GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", ctx->t_insn_count,
+  //            ctx->t_bb_count);
 
   *ctx->insn_count += ctx->t_insn_count;
   *ctx->bb_count += ctx->t_bb_count;
@@ -89,21 +75,10 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   return 0;
 }
 
-uint64_t empty[] = {0, 0, 0, 0};
-void basic_block_callback(void *arg, BasicBlock *bb) {
-  gdbctx *ctx = arg;
-  ctx->t_bb_count += 1;
-  ctx->t_insn_count += bb->ninsns;
-  // We don't need any info from the basic block, so just insert the address
-  if (unlikely(memcmp(bb->counters, empty, sizeof(empty)) == 0))
-    for (int i = 0; i < SKETCH_COL; ++i)
-      bb->counters[i] = fasthash64(&bb, sizeof(bb), i) & ctx->sketch.mask;
-  for (int i = 0; i < SKETCH_COL; ++i)
-    ctx->sketch.counters[i][bb->counters[i]]++;
-}
-
 void *pt_fork_func(void *args) {
   PTArgs *a = (PTArgs *)args;
+  // printf("%.16lx %.16lx\n", a->buf, a->n);
+  // fflush(stdout);
   pt_process_trace(a->ctx, a->buf, a->n);
   return NULL;
 }
@@ -167,21 +142,21 @@ int pt_init(gdbctx *ctx) {
     xperror("mmap");
 
   dec = malloc(sizeof(PTDecoder));
+  dec->counters_sz = 0x1000;
+  dec->counters = pbvt_calloc(dec->counters_sz, sizeof(uint64_t));
   dec_init(dec);
-  dec->on_bb = basic_block_callback;
-  dec->on_bb_ctx = ctx;
 
   return 0;
 }
 
-uint8_t ptbuf[2 * AUX_SIZE * PAGE_SIZE];
+uint64_t pt_hit_count(BasicBlock *bb) { return dec_hit_count(dec, bb); }
+
+void pt_clear_counters(void) { return dec_clear_hit_counters(dec); }
 
 // TODO: Updates to aux_tail must be atomic, we don't actually need to worry so
 // much because we know that our process is stopped and perf events have been
 // disabled.
-void pt_update_sketch(gdbctx *ctx) {
-  GDB_PRINTF("> %s\n", __FUNCTION__);
-
+void pt_update_counters(gdbctx *ctx) {
   if (ctx->pt_running) {
     GDB_PRINTF("Waiting for PT...\n", 0);
     pthread_join(ctx->pt_thread, NULL);
@@ -197,16 +172,18 @@ void pt_update_sketch(gdbctx *ctx) {
   /* smp_rmb() required as per /usr/include/linux/perf_event.h */
   // rmb();
 
+  uint8_t *mbuf;
+
   if (aux_tail <= aux_head) {
     trace_sz = aux_head - aux_tail;
-    assert(trace_sz < sizeof(ptbuf));
-    memcpy(ptbuf, ctx->aux + aux_tail, aux_head - aux_tail);
+    mbuf = malloc(trace_sz * sizeof(mbuf[0]) + 0x10);
+    memcpy(mbuf, ctx->aux + aux_tail, aux_head - aux_tail);
   } else {
     // Handle wrap-around
     trace_sz = (aux_head) + (ctx->header->aux_size - aux_tail);
-    assert(trace_sz < sizeof(ptbuf));
-    memcpy(ptbuf, ctx->aux + aux_tail, ctx->header->aux_size - aux_tail);
-    memcpy(ptbuf + (ctx->header->aux_size - aux_tail), ctx->aux, aux_head);
+    mbuf = malloc(trace_sz * sizeof(mbuf[0]) + 0x10);
+    memcpy(mbuf, ctx->aux + aux_tail, ctx->header->aux_size - aux_tail);
+    memcpy(mbuf + (ctx->header->aux_size - aux_tail), ctx->aux, aux_head);
   }
   asm volatile("" ::: "memory"); // Ensure the memory barrier
   assert(ctx->header->aux_head == aux_head);
@@ -223,8 +200,8 @@ void pt_update_sketch(gdbctx *ctx) {
 #endif
 
   pt_args.ctx = ctx;
-  pt_args.buf = ptbuf;
-  ptbuf[trace_sz] = 0x55;
+  pt_args.buf = mbuf;
+  mbuf[trace_sz] = 0x55;
   pt_args.n = trace_sz;
 
   pthread_attr_t pattr;
@@ -242,11 +219,11 @@ void pt_update_sketch(gdbctx *ctx) {
     exit(1);
   }
 
-  pthread_create(&ctx->pt_thread, &pattr, pt_fork_func, &pt_args);
-  ctx->pt_running = 1;
-  // pt_process_trace(ctx, ptbuf, trace_sz);
-  // ctx->pt_running = 0;
-  GDB_PRINTF("< %s\n", __FUNCTION__);
+  // pthread_create(&ctx->pt_thread, &pattr, pt_fork_func, &pt_args);
+  // ctx->pt_running = 1;
+  pt_process_trace(ctx, mbuf, trace_sz);
+  ctx->pt_running = 0;
+  free(mbuf);
 }
 
 void pt_build_cfg(gdbctx *ctx, uint64_t addr) {

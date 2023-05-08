@@ -76,6 +76,7 @@ typedef struct gdbctx {
 
   pthread_t pt_thread;
   int pt_running;
+  int pt_initialized;
 
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;
@@ -88,9 +89,9 @@ typedef struct gdbctx {
 
   size_t t_insn_count;
   size_t t_bb_count;
-} gdbctx;
 
-void sketch_init(Sketch *sketch);
+  int noack;
+} gdbctx;
 
 void breakpoint_add(gdbctx *ctx, Breakpoint *bp);
 void breakpoint_del(gdbctx *ctx, Breakpoint *bp);
@@ -117,6 +118,7 @@ void gdb_handle_m_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_m_set_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_p_set_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n);
+void gdb_handle_q_set_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_s_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n);
 void gdb_handle_z_add_commands(gdbctx *ctx, char *buf, size_t n);

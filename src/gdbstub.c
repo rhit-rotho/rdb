@@ -27,21 +27,21 @@ int starts_with(char *str, char *prefix) {
   return strncmp(prefix, str, strlen(prefix)) == 0;
 }
 
-void sketch_init(Sketch *sketch) {
-  sketch->sz = 0x1000;
-  sketch->mask = sketch->sz - 1;
-}
-
 void gdb_pause(gdbctx *ctx) {
   int status;
   xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
   xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+  if (ctx->pt_running) {
+    GDB_PRINTF("Waiting for PT...\n", 0);
+    pthread_join(ctx->pt_thread, NULL);
+    ctx->pt_running = 0;
+  }
 
   struct user_regs_struct xregs = {0};
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
   GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
-  pt_update_sketch(ctx);
+  pt_update_counters(ctx);
   gdb_disarm_timer(ctx);
 
   for (size_t i = 0; i < ctx->bps_sz; ++i)
@@ -59,9 +59,9 @@ void gdb_disarm_timer(gdbctx *ctx) {
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
   arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 50;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 20;
   arm.it_value.tv_sec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 50;
+  arm.it_value.tv_nsec = 1000 * 1000 * 20;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }
@@ -97,26 +97,21 @@ void gdb_continue(gdbctx *ctx) {
 }
 
 void gdb_save_state(gdbctx *ctx) {
-  xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+  struct user_regs_struct xregs = {0};
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+  GDB_PRINTF("[y] Initial IP: 0x%.16lx\n", ctx->regs->rip);
+  GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
+
+  // Counters are saved automatically as part of the previous commit :)
+  pt_update_counters(ctx);
+  pbvt_commit();
+
+  pt_clear_counters();
   ctx->regs->rax = 0;
   ctx->fpregs->cwd = 0;
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
   xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  if (ctx->pt_running) {
-    GDB_PRINTF("Waiting for PT...\n", 0);
-    pthread_join(ctx->pt_thread, NULL);
-    ctx->pt_running = 0;
-  }
-  struct user_regs_struct xregs = {0};
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
-  GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
-
-  // ctx->sketch is saved automatically as part of commit :)
-  pt_update_sketch(ctx);
-
-  pbvt_commit();
-  memset(ctx->sketch.counters[0], 0x00,
-         SKETCH_COL * ctx->sketch.sz * sizeof(ctx->sketch.counters[0][0]));
+  GDB_PRINTF("[x] Initial IP: 0x%.16lx\n", ctx->regs->rip);
   *ctx->insn_count = 0;
   *ctx->bb_count = 0;
 }
@@ -177,16 +172,18 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     n -= 1;
   }
 
-  // TODO: This should be a proper ack, not just whenever we think it'll pacify
+  // TODO: This should be a proper ack, not just whenever we think will pacify
   // GDB
-  write(ctx->fd, "+", 1);
+  if (!ctx->noack)
+    write(ctx->fd, "+", 1);
 
   if (*buf == '\x03') {
     if (!ctx->stopped)
       gdb_pause(ctx);
-
     gdb_save_state(ctx);
-    write(ctx->fd, "+", 1);
+
+    if (!ctx->noack)
+      write(ctx->fd, "+", 1);
     gdb_send_packet(ctx, "S05"); // sigtrap x86
     buf += 1;
     n -= 1;
@@ -227,6 +224,8 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
     return gdb_handle_p_set_commands(ctx, buf, n);
   case 'q':
     return gdb_handle_q_commands(ctx, buf, n);
+  case 'Q':
+    return gdb_handle_q_set_commands(ctx, buf, n);
   case 's':
     return gdb_handle_s_commands(ctx, buf, n);
   case 'v':
@@ -241,7 +240,6 @@ void gdb_handle_packet(gdbctx *ctx, char *buf, size_t n) {
   case 'G':
   case 'p':
   case 'T':
-  case 'Q':
   default:
     GDB_PRINTF("Unandled %s\n", buf);
     gdb_send_empty(ctx);
@@ -283,16 +281,18 @@ size_t hex_decode(char *hex, char *output, size_t n) {
   return decoded_len;
 }
 
+size_t hit_count_get(BasicBlock *bb) { return pt_hit_count(bb); }
+
 // Handle backwards commands
 void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
   UNUSED(n);
 
   switch (buf[0]) {
   case 'c': {
-    if (!ctx->stopped) {
+    if (!ctx->stopped)
       gdb_pause(ctx);
-      gdb_save_state(ctx);
-    }
+    gdb_save_state(ctx);
+    xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
 
     // TODO: This mechanic only works if we call reverse-continue once, we
     // need a way to describe "already in introspection" states.
@@ -308,22 +308,22 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
       tot_insn += *ctx->insn_count;
       pbvt_checkout(c);
       for (size_t i = 0; i < ctx->bps_sz; ++i) {
-        uint64_t block_ip = (uint64_t)rht_get(bb_insn, ctx->bps[i].ip);
-        if (!block_ip)
+        BasicBlock *bb = (BasicBlock *)rht_get(bb_insn, ctx->bps[i].ip);
+        if (!bb)
           continue;
         GDB_PRINTF("Hit basic block 0x%.16lx %ld times (for bp 0x%.16lx) since "
                    "the last "
                    "checkpoint\n",
-                   block_ip, hit_count_get(&ctx->sketch, block_ip),
-                   ctx->bps[i].ip);
-        if (hit_count_get(&ctx->sketch, block_ip) > 0) {
+                   bb->start, hit_count_get(bb), ctx->bps[i].ip);
+        if (hit_count_get(bb) > 0) {
           bp = &ctx->bps[i];
-          break;
+          goto found;
         }
       }
       c = c->parent;
     }
 
+  found:
     if (c == pbvt_branch_head("head")) {
       GDB_PRINTF("Rewound to head! IP: 0x%.16lx (tot: %'ld)\n", ctx->regs->rip,
                  tot_insn);
@@ -345,10 +345,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     // TODO: Inject signals/syscalls/etc. when rewinding.
 
     if (bp) {
-      // Grab this before we checkout so we don't get the hit counts for the
-      // *previous* snapshot.
-      uint64_t block_ip = (uint64_t)rht_get(bb_insn, (uint64_t)bp->ip);
-      size_t hit_cnt = hit_count_get(&ctx->sketch, block_ip);
+      BasicBlock *bb = (BasicBlock *)rht_get(bb_insn, (uint64_t)bp->ip);
+      size_t hit_cnt = hit_count_get(bb);
       pbvt_checkout(c->parent);
       xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
       xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
@@ -385,10 +383,9 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     break;
   }
   case 's': {
-    if (!ctx->stopped) {
+    if (!ctx->stopped)
       gdb_pause(ctx);
-      gdb_save_state(ctx);
-    }
+    gdb_save_state(ctx);
 
     pbvt_checkout(pbvt_commit_parent(pbvt_head()));
     xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
@@ -580,8 +577,8 @@ void gdb_handle_p_set_commands(gdbctx *ctx, char *buf, size_t n) {
 
   if (!ctx->stopped)
     gdb_pause(ctx);
-
   gdb_save_state(ctx);
+
   size_t regid = strtoull(buf, &endptr, 0x10);
 
   buf = endptr;
@@ -680,9 +677,11 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
       gdb_send_packet(ctx, "4f4b"); // 'OK'
     }
   } else if (starts_with(buf, "Supported")) {
-    gdb_send_packet(ctx, "PacketSize=47ff;ReverseStep+;ReverseContinue+;qXfer:"
-                         "exec-file:read+;qXfer:features:read+;qXfer:libraries-"
-                         "svr4:read+;qXfer:auxv:read+;swbreak+;multiprocess+");
+    gdb_send_packet(
+        ctx,
+        "PacketSize=47ff;ReverseStep+;QStartNoAckMode+;ReverseContinue+;qXfer:"
+        "exec-file:read+;qXfer:features:read+;qXfer:libraries-"
+        "svr4:read+;qXfer:auxv:read+;swbreak+;multiprocess+");
   } else if (starts_with(buf, "TStatus")) {
     gdb_send_empty(ctx);
   } else if (starts_with(buf, "Offsets")) {
@@ -782,6 +781,13 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
   } else {
     GDB_PRINTF("Unimplemented query: '%s'\n", buf);
     gdb_send_empty(ctx);
+  }
+}
+
+void gdb_handle_q_set_commands(gdbctx *ctx, char *buf, size_t n) {
+  if (starts_with(buf, "StartNoAckMode")) {
+    ctx->noack = 1;
+    return gdb_send_packet(ctx, "OK");
   }
 }
 
@@ -910,10 +916,10 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
     case 's': {
       int status;
       char tmp[0x20];
-      if (!ctx->stopped) {
+      if (!ctx->stopped)
         gdb_pause(ctx);
-        gdb_save_state(ctx);
-      }
+      gdb_save_state(ctx);
+
       xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
       waitpid(ctx->ppid, &status, 0);
       snprintf(tmp, sizeof(tmp), "S%.2x", WSTOPSIG(status));
@@ -921,10 +927,10 @@ void gdb_handle_v_commands(gdbctx *ctx, char *buf, size_t n) {
       break;
     }
     case 'C': {
-      if (!ctx->stopped) {
+      if (!ctx->stopped)
         gdb_pause(ctx);
-        gdb_save_state(ctx);
-      }
+      gdb_save_state(ctx);
+
       buf += 1;
       printf("sig: %.16lx\n", strtoull(buf, NULL, 0x10));
       xptrace(PTRACE_SYSCALL, ctx->ppid, NULL, strtoull(buf, NULL, 0x10));

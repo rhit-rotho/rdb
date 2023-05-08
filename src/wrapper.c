@@ -48,8 +48,7 @@ void sighandler(int signo) {
   UNUSED(signo);
   GDB_PRINTF("pid:%d tid:%d ppid:%d I got the signal!\n", getpid(), gettid(),
              getppid());
-  kill(ppid, SIGINT);
-  exit(0);
+  assert(0);
 }
 
 double get_time(void);
@@ -86,7 +85,7 @@ int gdbstub(void *args) {
 
   pbvt_init();
 
-  signal(SIGSEGV, sighandler);
+  // signal(SIGSEGV, sighandler);
 
   // GDB_PRINTF("Press [enter] to continue...\n", 0);
   // char t;
@@ -172,12 +171,6 @@ int gdbstub(void *args) {
   ctx->bb_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
   ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
-
-  // TODO: Calculate this based on size of executable memory
-  sketch_init(&ctx->sketch);
-  uint32_t *alloc = pbvt_calloc(ctx->sketch.sz * SKETCH_COL, sizeof(uint32_t));
-  for (int i = 0; i < SKETCH_COL; ++i)
-    ctx->sketch.counters[i] = &alloc[i * ctx->sketch.sz];
 
   xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);

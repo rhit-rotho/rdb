@@ -3,7 +3,6 @@
 #include <string.h>
 
 #include "cassert.h"
-#include "mmap_malloc.h"
 #include "rdb_hashtable.h"
 
 #define likely(x) __builtin_expect((x), 1)
@@ -42,6 +41,10 @@ void rht_rekey(RHashTable *ht) {
   hn->cap = ht->cap * 2;
   hn->mask = hn->cap - 1;
   hn->buckets = ht->calloc(hn->cap, sizeof(RHashBucket));
+  assert(hn->buckets!=NULL);
+  hn->calloc = ht->calloc;
+  hn->malloc = ht->malloc;
+  hn->free = ht->free;
 
   // reinsert
   for (size_t i = 0; i < ht->cap; ++i) {

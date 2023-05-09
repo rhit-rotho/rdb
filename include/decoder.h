@@ -93,3 +93,4 @@ void dec_hit_counters(PTDecoder *dec);
 
 void dec_clear_hit_counters(PTDecoder *dec);
 uint64_t dec_hit_count(PTDecoder *dec, BasicBlock *bb);
+void dec_set_count(PTDecoder *dec, BasicBlock *bb, uint64_t cnt);

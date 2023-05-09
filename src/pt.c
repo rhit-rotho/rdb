@@ -33,16 +33,88 @@ double get_time() {
   return tp.tv_sec + tp.tv_nsec * 1e-9;
 }
 
-typedef struct PTArgs {
+typedef struct JobArgs {
   gdbctx *ctx;
   uint8_t *buf;
-  size_t n;
-} PTArgs;
+  size_t sz;
+} JobArgs;
+
+void process_trace(void *args) {
+  JobArgs *jargs = args;
+  pt_process_trace(jargs->ctx, jargs->buf, jargs->sz);
+  free(jargs->buf);
+  free(jargs);
+}
+
+void *worker_thread(void *arg) {
+  WorkQueue *queue = (WorkQueue *)arg;
+
+  while (1) {
+    atomic_mutex_lock(&queue->mutex);
+    while (queue->size == 0) {
+      atomic_cond_var_signal(&queue->cwork);
+      atomic_cond_var_wait(&queue->cmain, &queue->mutex);
+    }
+    size_t idx = queue->head;
+    atomic_mutex_unlock(&queue->mutex);
+
+    Job job = queue->jobs[idx];
+    job.function(job.argument);
+
+    atomic_mutex_lock(&queue->mutex);
+    queue->head = (queue->head + 1) % queue->cap;
+    queue->size--;
+    atomic_mutex_unlock(&queue->mutex);
+    atomic_cond_var_signal(&queue->cmain);
+  }
+
+  return NULL;
+}
+
+void submit_job(WorkQueue *queue, void (*function)(void *), void *arg) {
+  // GDB_PRINTF("%s\n", __FUNCTION__);
+  atomic_mutex_lock(&queue->mutex);
+
+  if (queue->size == queue->cap) {
+    int new_capacity = 2 * queue->cap;
+    Job *new_jobs = (Job *)realloc(queue->jobs, new_capacity * sizeof(Job));
+    if (!new_jobs) {
+      fprintf(stderr, "Failed to expand the work queue\n");
+      exit(1);
+    }
+    if (queue->head > 0) {
+      memmove(new_jobs + queue->cap, new_jobs, queue->head * sizeof(Job));
+      queue->tail += queue->cap;
+    }
+    queue->jobs = new_jobs;
+    queue->cap = new_capacity;
+  }
+
+  queue->jobs[queue->tail].function = function;
+  queue->jobs[queue->tail].argument = arg;
+  queue->tail = (queue->tail + 1) % queue->cap;
+  queue->size++;
+  atomic_mutex_unlock(&queue->mutex);
+  atomic_cond_var_signal(&queue->cmain);
+}
+
+void wait_for_jobs(WorkQueue *queue) {
+  // GDB_PRINTF("%s\n", __FUNCTION__);
+  // usleep(10000);
+  atomic_mutex_lock(&queue->mutex);
+  // GDB_PRINTF("%s\n", __FUNCTION__);
+  // GDB_PRINTF("%s %.16lx %.16lx %.16lx\n", __FUNCTION__, queue->size,
+  //  queue->head, queue->tail);
+  while (queue->size > 0)
+    atomic_cond_var_wait(&queue->cwork, &queue->mutex);
+  // GDB_PRINTF("%s\n", __FUNCTION__);
+  atomic_mutex_unlock(&queue->mutex);
+  // GDB_PRINTF("%s\n", __FUNCTION__);
+}
 
 PTDecoder *dec;
-PTArgs pt_args;
 
-int counter = 0;
+// int counter = 0;
 int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   UNUSED(ctx);
 
@@ -73,14 +145,6 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   *ctx->bb_count += ctx->t_bb_count;
 
   return 0;
-}
-
-void *pt_fork_func(void *args) {
-  PTArgs *a = (PTArgs *)args;
-  // printf("%.16lx %.16lx\n", a->buf, a->n);
-  // fflush(stdout);
-  pt_process_trace(a->ctx, a->buf, a->n);
-  return NULL;
 }
 
 int pt_init(gdbctx *ctx) {
@@ -146,6 +210,34 @@ int pt_init(gdbctx *ctx) {
   dec->counters = pbvt_calloc(dec->counters_sz, sizeof(uint64_t));
   dec_init(dec);
 
+  WorkQueue *queue = malloc(sizeof(WorkQueue));
+  queue->cap = 100;
+  queue->jobs = calloc(queue->cap, sizeof(Job));
+  queue->size = 0;
+  queue->head = 0;
+  queue->tail = 0;
+  atomic_cond_var_init(&queue->cwork, NULL);
+  atomic_cond_var_init(&queue->cmain, NULL);
+  atomic_mutex_init(&queue->mutex, NULL);
+  ctx->pt_queue = (void *)queue;
+
+  pthread_attr_t pattr;
+  pthread_attr_init(&pattr);
+
+  int target_core = 0; // Set the target core number here (e.g., core 1)
+  cpu_set_t cpuset;
+
+  // Set the CPU affinity for the thread
+  CPU_ZERO(&cpuset);
+  CPU_SET(target_core, &cpuset);
+
+  if (pthread_attr_setaffinity_np(&pattr, sizeof(cpu_set_t), &cpuset)) {
+    perror("pthread_setaffinity_np");
+    exit(1);
+  }
+
+  pthread_create(&ctx->pt_thread, &pattr, worker_thread, ctx->pt_queue);
+
   return 0;
 }
 
@@ -157,12 +249,6 @@ void pt_clear_counters(void) { return dec_clear_hit_counters(dec); }
 // much because we know that our process is stopped and perf events have been
 // disabled.
 void pt_update_counters(gdbctx *ctx) {
-  if (ctx->pt_running) {
-    GDB_PRINTF("Waiting for PT...\n", 0);
-    pthread_join(ctx->pt_thread, NULL);
-    ctx->pt_running = 0;
-  }
-
   size_t trace_sz = 0;
 
   uint64_t aux_head = ctx->header->aux_head;
@@ -189,9 +275,9 @@ void pt_update_counters(gdbctx *ctx) {
   assert(ctx->header->aux_head == aux_head);
   ctx->header->aux_tail = aux_head;
 
-  GDB_PRINTF(
-      "Read from 0x%.6lx to 0x%.6lx (trace: 0x%.6lx, tot_size: 0x%.6lx)\n",
-      aux_tail, aux_head, trace_sz, ctx->header->aux_size);
+  // GDB_PRINTF(
+  //     "Read from 0x%.6lx to 0x%.6lx (trace: 0x%.6lx, tot_size: 0x%.6lx)\n",
+  //     aux_tail, aux_head, trace_sz, ctx->header->aux_size);
 #ifdef PT_DEBUG
   // GDB_PRINTF("", 0);
   // for (size_t i = 0; i < trace_sz; ++i)
@@ -199,31 +285,35 @@ void pt_update_counters(gdbctx *ctx) {
   // printf("\n");
 #endif
 
-  pt_args.ctx = ctx;
-  pt_args.buf = mbuf;
   mbuf[trace_sz] = 0x55;
-  pt_args.n = trace_sz;
 
-  pthread_attr_t pattr;
-  pthread_attr_init(&pattr);
-
-  int target_core = 0; // Set the target core number here (e.g., core 1)
-  cpu_set_t cpuset;
-
-  // Set the CPU affinity for the thread
-  CPU_ZERO(&cpuset);
-  CPU_SET(target_core, &cpuset);
-
-  if (pthread_attr_setaffinity_np(&pattr, sizeof(cpu_set_t), &cpuset)) {
-    perror("pthread_setaffinity_np");
-    exit(1);
-  }
-
-  // pthread_create(&ctx->pt_thread, &pattr, pt_fork_func, &pt_args);
-  // ctx->pt_running = 1;
+#if 1
+  JobArgs *args = malloc(sizeof(JobArgs));
+  args->ctx = ctx;
+  args->buf = mbuf;
+  args->sz = trace_sz;
+  submit_job((WorkQueue *)ctx->pt_queue, process_trace, args);
+#else
   pt_process_trace(ctx, mbuf, trace_sz);
-  ctx->pt_running = 0;
   free(mbuf);
+#endif
+}
+
+void pt_finalize(gdbctx *ctx) {
+  // GDB_PRINTF("%s\n", __FUNCTION__);
+  wait_for_jobs((WorkQueue *)ctx->pt_queue);
+  assert(((WorkQueue *)ctx->pt_queue)->size == 0);
+
+  WorkQueue *q = (WorkQueue *)ctx->pt_queue;
+  atomic_mutex_lock(&q->mutex);
+  GDB_PRINTF("%s %.16lx %.16lx %.16lx\n", __FUNCTION__, q->size, q->head,
+             q->tail);
+
+  atomic_mutex_unlock(&q->mutex);
+}
+
+void pt_set_count(BasicBlock *bb, uint64_t cnt) {
+  return dec_set_count(dec, bb, cnt);
 }
 
 void pt_build_cfg(gdbctx *ctx, uint64_t addr) {

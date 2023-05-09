@@ -52,8 +52,7 @@ char *BB_TYPES[] = {"INVALID", "JMP", "B", "ICALL", "CALL", "RET"};
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
-static inline uint64_t murmurhash3_128_to_64(const uint64_t high,
-                                             const uint64_t low) {
+uint64_t murmurhash3_128_to_64(const uint64_t high, const uint64_t low) {
   const uint64_t c1 = 0x87c37b91114253d5ULL;
   const uint64_t c2 = 0x4cf5ad432745937fULL;
 
@@ -90,14 +89,13 @@ TransitionTrace *trace_init() {
   return trace;
 }
 
-static inline void trace_push_t(TransitionTrace *trace, uint8_t tnt) {
+void trace_push_t(TransitionTrace *trace, uint8_t tnt) {
   trace->tmp <<= 1;
   trace->tmp |= tnt;
   trace->tmpsz += 1;
 }
 
-static inline void trace_push(TransitionTrace *tt, BasicBlock *bb,
-                              uint8_t tnt) {
+void trace_push(TransitionTrace *tt, BasicBlock *bb, uint8_t tnt) {
   assert(bb != NULL);
 
   if (tt->sz == tt->cap) {
@@ -329,7 +327,6 @@ BasicBlock *dec_transition_to_next_conditional(PTDecoder *dec) {
       bb = dec_get_bb(dec, bb->out[0]);
       break;
     case BB_RET:
-      assert(0 && "TODO:RET");
       bb = dec_get_bb(dec, dec->bind_targets[dec->bpos_r]);
       dec->bpos_r = (dec->bpos_r + 1 + BPOS_SZ) % BPOS_SZ;
       break;
@@ -346,17 +343,15 @@ BasicBlock *dec_transition_to_next_conditional(PTDecoder *dec) {
   return bb;
 }
 
-__attribute__((hot)) static inline void dec_flush_tnt(PTDecoder *dec,
-                                                      TransitionTrace *tt) {
+__attribute__((hot)) void dec_flush_tnt(PTDecoder *dec, TransitionTrace *tt) {
   size_t matchsz = 64;
-  if (dec->current_bb == NULL) {
+  if (unlikely(dec->current_bb == NULL)) {
     BasicBlock *seen = rht_get(bb_insn, dec->bind_targets[dec->bpos_r]);
     if (seen)
       dec->current_bb = seen;
     else
       dec->current_bb = dec_get_bb(dec, dec->bind_targets[dec->bpos_r]);
     dec->bpos_r++;
-    // dec->current_bb->hits++;
     dec->counters[dec->current_bb->id]++;
   }
 
@@ -382,13 +377,11 @@ __attribute__((hot)) static inline void dec_flush_tnt(PTDecoder *dec,
         trace_push(tt, dec->current_bb, 0);
         BasicBlock *tbb = dec_transition_to_next_conditional(dec);
         dec->current_bb = dec_get_bb(dec, tbb->out[1]);
-        // dec->current_bb->hits++;
         dec->counters[dec->current_bb->id]++;
       } else {
         trace_push(tt, dec->current_bb, 1);
         BasicBlock *tbb = dec_transition_to_next_conditional(dec);
         dec->current_bb = dec_get_bb(dec, tbb->out[0]);
-        // dec->current_bb->hits++;
         dec->counters[dec->current_bb->id]++;
       }
     }
@@ -397,7 +390,7 @@ __attribute__((hot)) static inline void dec_flush_tnt(PTDecoder *dec,
   }
 }
 
-static inline void dec_taken(PTDecoder *dec) {
+void dec_taken(PTDecoder *dec) {
   trace_push_t(dec->tt, 1);
 #if 1
   dec_flush_tnt(dec, dec->tt);
@@ -408,7 +401,7 @@ static inline void dec_taken(PTDecoder *dec) {
 #endif
 }
 
-static inline void dec_not_taken(PTDecoder *dec) {
+void dec_not_taken(PTDecoder *dec) {
   trace_push_t(dec->tt, 0);
 #if 1
   dec_flush_tnt(dec, dec->tt);
@@ -419,7 +412,7 @@ static inline void dec_not_taken(PTDecoder *dec) {
 #endif
 }
 
-static inline uint64_t dec_get_target_ip(uint8_t **trace, uint64_t ip) {
+uint64_t dec_get_target_ip(uint8_t **trace, uint64_t ip) {
   uint8_t *tp = *trace;
   uint8_t kind = (tp[0] >> 5) & 7;
   uint64_t tip = *(uint64_t *)&tp[1];
@@ -959,19 +952,14 @@ handle_pt_exit:
   TransitionTrace *tt = dec->tt;
   // fast-forward to the high bits
   tt->tmp <<= (8 * sizeof(tt->tmp) - tt->tmpsz);
-  // printf("tmp: ");
-  // bin(tt->tmp, 64);
-  // puts("");
   for (size_t i = 0; i < tt->tmpsz; ++i, tt->tmp <<= 1) {
     if ((tt->tmp & (1ull << (8 * sizeof(tt->tmp) - 1))) == 0) { // Not taken
       BasicBlock *tbb = dec_transition_to_next_conditional(dec);
       dec->current_bb = dec_get_bb(dec, tbb->out[1]);
-      // dec->current_bb->hits++;
       dec->counters[dec->current_bb->id]++;
     } else {
       BasicBlock *tbb = dec_transition_to_next_conditional(dec);
       dec->current_bb = dec_get_bb(dec, tbb->out[0]);
-      // dec->current_bb->hits++;
       dec->counters[dec->current_bb->id]++;
     }
   }
@@ -996,6 +984,10 @@ void dec_clear_hit_counters(PTDecoder *dec) {
 
 uint64_t dec_hit_count(PTDecoder *dec, BasicBlock *bb) {
   return dec->counters[bb->id];
+}
+
+void dec_set_count(PTDecoder*dec, BasicBlock*bb, uint64_t cnt) {
+  return dec->counters[bb->id]=cnt;
 }
 
 void dec_hit_counters(PTDecoder *dec) {

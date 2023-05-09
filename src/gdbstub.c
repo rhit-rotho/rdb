@@ -32,15 +32,10 @@ void gdb_pause(gdbctx *ctx) {
   xptrace(PTRACE_INTERRUPT, ctx->ppid, NULL, NULL);
   waitpid(ctx->ppid, &status, 0);
   xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
-  if (ctx->pt_running) {
-    GDB_PRINTF("Waiting for PT...\n", 0);
-    pthread_join(ctx->pt_thread, NULL);
-    ctx->pt_running = 0;
-  }
 
   struct user_regs_struct xregs = {0};
   xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
-  GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
+  // GDB_PRINTF("Final IP: 0x%.16lx\n", xregs.rip);
   pt_update_counters(ctx);
   gdb_disarm_timer(ctx);
 
@@ -59,9 +54,9 @@ void gdb_disarm_timer(gdbctx *ctx) {
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
   arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 20;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 50;
   arm.it_value.tv_sec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 20;
+  arm.it_value.tv_nsec = 1000 * 1000 * 50;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }
@@ -104,6 +99,7 @@ void gdb_save_state(gdbctx *ctx) {
 
   // Counters are saved automatically as part of the previous commit :)
   pt_update_counters(ctx);
+  pt_finalize(ctx);
   pbvt_commit();
 
   pt_clear_counters();
@@ -377,6 +373,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
       ctx->regs->rip -= 1;
       xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
       ctx->stopped = 1;
+
+      // TODO: Fix instruction counts and commit
     }
 
     gdb_send_packet(ctx, "S05"); // sigtrap x86

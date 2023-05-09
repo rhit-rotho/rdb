@@ -75,8 +75,7 @@ typedef struct gdbctx {
   double prev_snapshot;
 
   pthread_t pt_thread;
-  int pt_running;
-  int pt_initialized;
+  void* pt_queue;
 
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;

@@ -166,7 +166,6 @@ int gdbstub(void *args) {
 
   ctx->ppid = ppid;
   ctx->stopped = 1;
-  ctx->pt_running = 0;
   ctx->insn_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->bb_count = pbvt_calloc(1, sizeof(uint64_t));
   ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
@@ -337,11 +336,12 @@ int gdbstub(void *args) {
       if (ctx->stopped)
         continue;
 
-      GDB_PRINTF("Snapshot because of timeout elapsed %lf\n",
-                 get_time() - ctx->prev_snapshot);
-
       gdb_pause(ctx);
-      if (ctx->snapshot_counter == 0x10) {
+      if (ctx->snapshot_counter == 20) {
+        GDB_PRINTF("Snapshot because of timeout elapsed %lf\n",
+                   get_time() - ctx->prev_snapshot);
+        ctx->prev_snapshot = get_time();
+
         gdb_save_state(ctx);
         ctx->snapshot_counter = 0;
       } else {
@@ -349,7 +349,6 @@ int gdbstub(void *args) {
       }
       gdb_continue(ctx);
 
-      ctx->prev_snapshot = get_time();
       continue;
     }
 
@@ -366,7 +365,8 @@ __attribute__((constructor)) static void wrapper_init(void) {
   ppid = getpid();
   if (pipe(fildes) < 0)
     xperror("pipe");
-  clone(gdbstub, gdbstub_stk + STACK_SIZE, CLONE_VM, NULL);
+  clone(gdbstub, gdbstub_stk + STACK_SIZE, CLONE_VM | CLONE_FS | CLONE_FILES,
+        NULL);
   read(fildes[0], &c, 1);
 }
 

@@ -295,6 +295,7 @@ int gdbstub(void *args) {
         ctx->stopped = 1;
         continue;
       } else if (WSTOPSIG(status) == SIGSEGV) {
+        gdb_save_state(ctx);
         gdb_send_packet(ctx, "S0b");
         ctx->stopped = 1;
         continue;
@@ -337,7 +338,7 @@ int gdbstub(void *args) {
         continue;
 
       gdb_pause(ctx);
-      if (ctx->snapshot_counter == 20) {
+      if (ctx->snapshot_counter + 1 == 20) {
         GDB_PRINTF("Snapshot because of timeout elapsed %lf\n",
                    get_time() - ctx->prev_snapshot);
         ctx->prev_snapshot = get_time();

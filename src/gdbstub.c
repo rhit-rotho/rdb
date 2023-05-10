@@ -1,3 +1,4 @@
+#include <capstone/capstone.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/perf_event.h>
@@ -54,9 +55,9 @@ void gdb_disarm_timer(gdbctx *ctx) {
 void gdb_arm_timer(gdbctx *ctx) {
   struct itimerspec arm = {0};
   arm.it_interval.tv_sec = 0;
-  arm.it_interval.tv_nsec = 1000 * 1000 * 50;
+  arm.it_interval.tv_nsec = 1000 * 1000 * 10;
   arm.it_value.tv_sec = 0;
-  arm.it_value.tv_nsec = 1000 * 1000 * 50;
+  arm.it_value.tv_nsec = 1000 * 1000 * 10;
   if (timerfd_settime(ctx->timerfd, 0, &arm, NULL) < 0)
     xperror("timerfd_settime");
 }
@@ -69,7 +70,7 @@ void breakpoint_add(gdbctx *ctx, Breakpoint *bp) {
   uint8_t data[WORD_SIZE];
   uintptr_t addr = bp->ip;
   memcpy(data, (void *)(addr & ~WORD_MASK), WORD_SIZE);
-  memcpy(&ctx->bps[ctx->bps_sz].patch, data, WORD_SIZE);
+  memcpy(&bp->patch, data, WORD_SIZE);
 
   data[(uintptr_t)addr & WORD_MASK] = 0xcc;
   xptrace(PTRACE_POKEDATA, ctx->ppid, addr & ~WORD_MASK, *(uint64_t *)data);
@@ -277,8 +278,6 @@ size_t hex_decode(char *hex, char *output, size_t n) {
   return decoded_len;
 }
 
-size_t hit_count_get(BasicBlock *bb) { return pt_hit_count(bb); }
-
 // Handle backwards commands
 void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
   UNUSED(n);
@@ -288,10 +287,6 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
     if (!ctx->stopped)
       gdb_pause(ctx);
     gdb_save_state(ctx);
-    xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
-
-    // TODO: This mechanic only works if we call reverse-continue once, we
-    // need a way to describe "already in introspection" states.
 
     Commit *c = pbvt_head();
     Breakpoint *bp = NULL;
@@ -310,8 +305,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
         GDB_PRINTF("Hit basic block 0x%.16lx %ld times (for bp 0x%.16lx) since "
                    "the last "
                    "checkpoint\n",
-                   bb->start, hit_count_get(bb), ctx->bps[i].ip);
-        if (hit_count_get(bb) > 0) {
+                   bb->start, pt_hit_count(bb), ctx->bps[i].ip);
+        if (pt_hit_count(bb) > 0) {
           bp = &ctx->bps[i];
           goto found;
         }
@@ -342,7 +337,7 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 
     if (bp) {
       BasicBlock *bb = (BasicBlock *)rht_get(bb_insn, (uint64_t)bp->ip);
-      size_t hit_cnt = hit_count_get(bb);
+      size_t hit_cnt = pt_hit_count(bb);
       pbvt_checkout(c->parent);
       xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
       xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
@@ -351,43 +346,282 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
                  ctx->regs->rip);
       breakpoint_add(ctx, bp);
 
+      struct user_regs_struct xregs;
+      size_t inc = hit_cnt / 2;
+      size_t tot = inc;
       int status;
-      ctx->regs->rax = 0;
+      size_t previ = 0;
       for (size_t i = 0; i < hit_cnt - 1; ++i) {
+        xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
         xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
         waitpid(ctx->ppid, &status, 0);
-        xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+        xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+        xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+        xregs.rip -= 1;
         breakpoint_del(ctx, bp);
-        ctx->regs->rip -= 1;
-        xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+        xptrace(PTRACE_SETREGS, ctx->ppid, NULL, &xregs);
+
+        if (i % 0x20 == 0)
+          pt_update_counters(ctx);
+
+        // TODO: Exponential save
+        if (i == tot) {
+          printf("%.16ld\n", i);
+          if (inc > 100) {
+            // TODO: This is a bug in the PT decoder when enctounering the end
+            // of a block.
+            pt_update_counters(ctx);
+            pt_finalize(ctx);
+            pt_set_count(bb, i - previ);
+            previ = i;
+            gdb_save_state(ctx);
+            inc /= 2;
+            tot += inc;
+          }
+        }
+
         xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
         waitpid(ctx->ppid, &status, 0);
         breakpoint_add(ctx, bp);
       }
 
       // Remove breakpoint
+      xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
       xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
       waitpid(ctx->ppid, &status, 0);
-      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+      xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+      xregs.rip -= 1;
       breakpoint_del(ctx, bp);
-      ctx->regs->rip -= 1;
-      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, &xregs);
       ctx->stopped = 1;
 
-      // TODO: Fix instruction counts and commit
+      pt_update_counters(ctx);
+      pt_finalize(ctx);
+      GDB_PRINTF("Hit cnt was %.16ld, now %.16ld\n", pt_hit_count(bb),
+                 pt_hit_count(bb) - 1);
+      // pt_set_count(bb, pt_hit_count(bb));
+      gdb_save_state(ctx);
     }
 
     gdb_send_packet(ctx, "S05"); // sigtrap x86
     break;
   }
   case 's': {
+    // Okay, if we have an accurate instruction count, we single-step that many.
+    // Otherwise, if we know the current instruction and the previous is in the
+    // same BB, then we can copy the same algorithm from above, and on the last
+    // instance single-step to the previous instruction.
+
     if (!ctx->stopped)
       gdb_pause(ctx);
     gdb_save_state(ctx);
 
-    pbvt_checkout(pbvt_commit_parent(pbvt_head()));
+    struct user_regs_struct xregs;
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+    uint64_t cip = xregs.rip;
+
+    BasicBlock *bb = rht_get(bb_insn, cip);
+
+    // TODO: Find all basic blocks that transition to us, the total number of
+    // hits across all basic blocks gives us the information necessary to find
+    // the last block that transitioned to this one. This may not be possible
+    // using only hit counts, since all the BBs that could transition to us may
+    // *not* (e.g., conditional jumps).
+
+    // How about this:
+    // 1. Find all incoming BBs
+    // 2. For UJMPs, our hit count += BB.hits
+    // 3. For CJMPs, our hit count += BB.hits - ALT.hits
+    // This approach is invalidated by ICALLs and FCALLs
+
+    if (cip == bb->start) {
+      GDB_PRINTF("UNSUPPORTED: Transition to previous BB %.16lx == %.16lx.\n",
+                 cip, bb->start);
+
+      Breakpoint bps[0x10] = {0};
+      ssize_t hit_cnt;
+
+      pbvt_checkout(pbvt_head()->parent);
+      hit_cnt = pt_incoming_bbs_hits(bb, bps);
+      pbvt_checkout(pbvt_head()->parent);
+
+      GDB_PRINTF("%.16lx: %.16lx\n", bb->start, hit_cnt);
+      GDB_PRINTF("Current RIP: %.16lx Current BB: %.16lx (hit_cnt: %.16ld)\n",
+                 ctx->regs->rip, bb->start, hit_cnt);
+
+      size_t sz = 0;
+      while (bps[sz++].ip != 0ull)
+        ;
+      sz -= 1;
+
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
+      xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+      for (size_t i = 0; i < sz; ++i) {
+        GDB_PRINTF("BPS: %.16lx\n", ctx->regs->rip, bps[i].ip);
+        breakpoint_add(ctx, &bps[i]);
+      }
+
+      int status;
+      struct user_regs_struct xregs;
+      for (size_t i = 0; i < hit_cnt - 1; ++i) {
+        xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
+        xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+        waitpid(ctx->ppid, &status, 0);
+        xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+        xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+        // GDB_PRINTF("Continue.. %.16lx\n", xregs.rip);
+        Breakpoint *bp;
+        xregs.rip -= 1;
+        for (size_t j = 0; j < sz; ++j) {
+          // GDB_PRINTF("%.16lx %.16lx\n", xregs.rip, bps[j].ip);
+          if (xregs.rip == bps[j].ip) {
+            bp = &bps[j];
+            // GDB_PRINTF("J: %.16lx\n", bps[j].ip);
+            break;
+          }
+        }
+        breakpoint_del(ctx, bp);
+        xptrace(PTRACE_SETREGS, ctx->ppid, NULL, &xregs);
+
+        if (i % 0x20 == 0)
+          pt_update_counters(ctx);
+
+        // TODO: Exponential save
+
+        xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+        waitpid(ctx->ppid, &status, 0);
+        breakpoint_add(ctx, bp);
+      }
+
+      xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
+      xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+      xregs.rip -= 1;
+      GDB_PRINTF("Continue.. %.16lx\n", xregs.rip);
+      for (size_t j = 0; j < sz; ++j) {
+        GDB_PRINTF("%.16lx %.16lx\n", xregs.rip, bps[j].ip);
+        if (xregs.rip == bps[j].ip) {
+          breakpoint_del(ctx, &bps[j]);
+          GDB_PRINTF("%.16lx\n", bps[j].ip);
+          break;
+        }
+      }
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, &xregs);
+      ctx->stopped = 1;
+
+      for (size_t i = 0;
+           i < ((BasicBlock *)rht_get(bb_insn, xregs.rip))->ninsns - 1; ++i) {
+        xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+        waitpid(ctx->ppid, &status, 0);
+      }
+
+      gdb_save_state(ctx);
+      gdb_send_packet(ctx, "S05");
+      return;
+    }
+
+    pbvt_checkout(pbvt_head()->parent);
+    ssize_t hit_cnt = pt_hit_count(bb);
+    pbvt_checkout(pbvt_head()->parent);
+
+    GDB_PRINTF("Current RIP: %.16lx Current BB: %.16lx (hit_cnt: %.16ld)\n",
+               cip, bb->start, hit_cnt);
+
+    pbvt_checkout(pbvt_head()->parent);
     xptrace(PTRACE_SETREGS, ctx->ppid, NULL, ctx->regs);
     xptrace(PTRACE_SETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+
+    GDB_PRINTF("Rewound: 0x%.16lx\n", ctx->regs->rip);
+
+    // I'm going to go ahead and assume if the current instruction is not the
+    // beginning of the block, then the previous instruction executed was also
+    // in the same basic block, which seems like a reasonable assumption.
+
+    csh handle;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
+      printf("cs_open: %s\n", cs_strerror(cs_errno(handle)));
+      return;
+    }
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_insn *tinsn = cs_malloc(handle);
+
+    // Get ninsns executed
+    size_t ninsns = bb->ninsns;
+    uint64_t ip = bb->start;
+
+    for (ninsns = 0; ip < cip; ++ninsns) {
+      const uint8_t *code = (uint8_t *)ip;
+      uint64_t address = ip;
+      size_t sz = 0x10; // max size of x86 insn is 15 bytes
+      if (!cs_disasm_iter(handle, &code, &sz, &address, tinsn)) {
+        printf("Broke on invalid\n");
+        break;
+      }
+      ip += tinsn->size;
+    }
+
+    cs_free(tinsn, 1);
+    cs_close(&handle);
+
+    GDB_PRINTF("Found %.16ld instructions since beginning of block\n", ninsns);
+
+    int status;
+    Breakpoint bpd = {.ip = bb->start};
+    Breakpoint *bp = &bpd;
+    breakpoint_add(ctx, bp);
+
+    for (ssize_t i = 0; i < hit_cnt - 1; ++i) {
+      // xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
+      xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      // xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+      xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+      GDB_PRINTF("_\n", 0);
+      breakpoint_del(ctx, bp);
+      ctx->regs->rip -= 1;
+      xptrace(PTRACE_SETREGS, ctx->ppid, NULL, &xregs);
+
+      if (i % 0x20 == 0)
+        pt_update_counters(ctx);
+
+      // TODO: Exponential save
+
+      xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+      breakpoint_add(ctx, bp);
+    }
+
+    // Remove breakpoint
+    xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
+    xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+    waitpid(ctx->ppid, &status, 0);
+    xioctl(ctx->pfd, PERF_EVENT_IOC_DISABLE, 0);
+
+    xptrace(PTRACE_GETREGS, ctx->ppid, NULL, &xregs);
+    breakpoint_del(ctx, bp);
+    xregs.rip -= 1;
+    xptrace(PTRACE_SETREGS, ctx->ppid, NULL, &xregs);
+    ctx->stopped = 1;
+
+    // We're handling the case where the previous instruction was in the same
+    // basic block.
+
+    for (size_t i = 0; i < ninsns - 1; ++i) {
+      xptrace(PTRACE_SINGLESTEP, ctx->ppid, NULL, NULL);
+      waitpid(ctx->ppid, &status, 0);
+    }
+
+    gdb_save_state(ctx);
+    GDB_PRINTF("RIP: %.16lx\n", ctx->regs->rip);
     gdb_send_packet(ctx, "S05"); // sigtrap x86
     break;
   }
@@ -677,7 +911,7 @@ void gdb_handle_q_commands(gdbctx *ctx, char *buf, size_t n) {
   } else if (starts_with(buf, "Supported")) {
     gdb_send_packet(
         ctx,
-        "PacketSize=47ff;ReverseStep+;QStartNoAckMode+;ReverseContinue+;qXfer:"
+        "PacketSize=47ff;QStartNoAckMode+;ReverseStep+;ReverseContinue+;qXfer:"
         "exec-file:read+;qXfer:features:read+;qXfer:libraries-"
         "svr4:read+;qXfer:auxv:read+;swbreak+;multiprocess+");
   } else if (starts_with(buf, "TStatus")) {

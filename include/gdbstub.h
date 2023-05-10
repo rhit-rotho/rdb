@@ -38,7 +38,7 @@
   do {                                                                         \
     if (ptrace(req, pid, addr, data) == -1) {                                  \
       GDB_PRINTF("%s: %s\n", #req, strerror(errno));                           \
-      exit(-1);                                                                \
+      assert(0);                                                               \
     }                                                                          \
   } while (0)
 
@@ -75,7 +75,7 @@ typedef struct gdbctx {
   double prev_snapshot;
 
   pthread_t pt_thread;
-  void* pt_queue;
+  void *pt_queue;
 
   struct perf_event_mmap_page *header;
   void *base, *data, *aux;
@@ -85,9 +85,6 @@ typedef struct gdbctx {
 
   Breakpoint bps[0x20];
   size_t bps_sz;
-
-  size_t t_insn_count;
-  size_t t_bb_count;
 
   int noack;
 } gdbctx;

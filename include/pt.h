@@ -31,3 +31,6 @@ uint64_t pt_hit_count(BasicBlock *bb);
 void pt_clear_counters(void);
 void pt_finalize(gdbctx *ctx);
 void pt_set_count(BasicBlock *bb, uint64_t cnt);
+
+void pt_get_counts(size_t *bbs_cnt, size_t *insns_cnt);
+uint64_t pt_incoming_bbs_hits(BasicBlock *bb, Breakpoint *bps);

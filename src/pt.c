@@ -72,7 +72,6 @@ void *worker_thread(void *arg) {
 }
 
 void submit_job(WorkQueue *queue, void (*function)(void *), void *arg) {
-  // GDB_PRINTF("%s\n", __FUNCTION__);
   atomic_mutex_lock(&queue->mutex);
 
   if (queue->size == queue->cap) {
@@ -99,17 +98,10 @@ void submit_job(WorkQueue *queue, void (*function)(void *), void *arg) {
 }
 
 void wait_for_jobs(WorkQueue *queue) {
-  // GDB_PRINTF("%s\n", __FUNCTION__);
-  // usleep(10000);
   atomic_mutex_lock(&queue->mutex);
-  // GDB_PRINTF("%s\n", __FUNCTION__);
-  // GDB_PRINTF("%s %.16lx %.16lx %.16lx\n", __FUNCTION__, queue->size,
-  //  queue->head, queue->tail);
   while (queue->size > 0)
     atomic_cond_var_wait(&queue->cwork, &queue->mutex);
-  // GDB_PRINTF("%s\n", __FUNCTION__);
   atomic_mutex_unlock(&queue->mutex);
-  // GDB_PRINTF("%s\n", __FUNCTION__);
 }
 
 PTDecoder *dec;
@@ -125,12 +117,8 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
   // fwrite(buf, sizeof(buf[0]), n, f);
   // fclose(f);
 
-  double start = get_time();
-
-  ctx->t_insn_count = 0;
-  ctx->t_bb_count = 0;
-
   // GDB_PRINTF("Starting PT parse @ 0x%.16lx...\n", dec->last_ip);
+  // double start = get_time();
   int ret = dec_decode_trace(dec, buf, n);
 
   // GDB_PRINTF("Starting PT parse...done, took %lf seconds\n",
@@ -140,9 +128,6 @@ int pt_process_trace(gdbctx *ctx, uint8_t *buf, size_t n) {
 
   // GDB_PRINTF("Processed %'d instructions (%'d BBs).\n", ctx->t_insn_count,
   //            ctx->t_bb_count);
-
-  *ctx->insn_count += ctx->t_insn_count;
-  *ctx->bb_count += ctx->t_bb_count;
 
   return 0;
 }
@@ -278,12 +263,6 @@ void pt_update_counters(gdbctx *ctx) {
   // GDB_PRINTF(
   //     "Read from 0x%.6lx to 0x%.6lx (trace: 0x%.6lx, tot_size: 0x%.6lx)\n",
   //     aux_tail, aux_head, trace_sz, ctx->header->aux_size);
-#ifdef PT_DEBUG
-  // GDB_PRINTF("", 0);
-  // for (size_t i = 0; i < trace_sz; ++i)
-  //   printf("%.2x ", ptbuf[i]);
-  // printf("\n");
-#endif
 
   mbuf[trace_sz] = 0x55;
 
@@ -300,16 +279,8 @@ void pt_update_counters(gdbctx *ctx) {
 }
 
 void pt_finalize(gdbctx *ctx) {
-  // GDB_PRINTF("%s\n", __FUNCTION__);
   wait_for_jobs((WorkQueue *)ctx->pt_queue);
   assert(((WorkQueue *)ctx->pt_queue)->size == 0);
-
-  WorkQueue *q = (WorkQueue *)ctx->pt_queue;
-  atomic_mutex_lock(&q->mutex);
-  GDB_PRINTF("%s %.16lx %.16lx %.16lx\n", __FUNCTION__, q->size, q->head,
-             q->tail);
-
-  atomic_mutex_unlock(&q->mutex);
 }
 
 void pt_set_count(BasicBlock *bb, uint64_t cnt) {
@@ -319,4 +290,78 @@ void pt_set_count(BasicBlock *bb, uint64_t cnt) {
 void pt_build_cfg(gdbctx *ctx, uint64_t addr) {
   UNUSED(ctx);
   dec_build_cfg("cfg.dot", dec, addr);
+}
+
+// void pt_print_counts(void) {
+void pt_get_counts(size_t *bbs_cnt, size_t *insns_cnt) {
+  *bbs_cnt = 0;
+  *insns_cnt = 0;
+
+  size_t uniq = 0;
+
+  for (size_t i = 0; i < dec->bb_cnt; ++i) {
+    size_t bb_cnt = dec->counters[dec->bbs[i]->id];
+    *bbs_cnt += bb_cnt;
+    *insns_cnt += bb_cnt * dec->bbs[i]->ninsns;
+
+    if (bb_cnt > 0)
+      uniq += 1;
+  }
+}
+
+uint64_t pt_incoming_bbs_hits(BasicBlock *bb, Breakpoint *bps) {
+  const char *BB_TYPES[] = {"INVALID", "JMP", "B", "ICALL", "CALL", "RET"};
+  for (size_t i = 0; i < dec->bb_cnt; ++i) {
+    printf("%s\t%.16ld %.16ld\n", BB_TYPES[dec->bbs[i]->type],
+           dec->bbs[i]->start, dec->counters[dec->bbs[i]->id]);
+  }
+
+  size_t bpos = 0;
+
+  uint64_t hit_cnt = 0;
+  for (size_t i = 0; i < dec->bb_cnt; ++i) {
+    BasicBlock *t = dec->bbs[i];
+    switch (t->type) {
+    case BB_UNCONDITIONAL_JMP:
+      if (t->out[0] == bb->start) {
+        printf("%s (%ld) %.16lx -> %.16lx\n", BB_TYPES[t->type],
+               pt_hit_count(t), t->start, bb->start);
+        if (bps)
+          bps[bpos++].ip = t->start;
+        hit_cnt += pt_hit_count(t);
+      }
+      break;
+    case BB_CONDITIONAL_JMP:
+      if (t->out[0] == bb->start) {
+        printf("%s (%ld) %.16lx -> %.16lx\n", BB_TYPES[t->type],
+               pt_hit_count(t), t->start, bb->start);
+        if (bps)
+          bps[bpos++].ip = t->start;
+        hit_cnt += pt_incoming_bbs_hits(t, NULL);
+        //  - pt_hit_count(dec_get_bb(dec, t->out[1]));
+      }
+      if (t->out[1] == bb->start) {
+        printf("%s (%ld) %.16lx -> %.16lx\n", BB_TYPES[t->type],
+               pt_hit_count(t), t->start, bb->start);
+        if (bps)
+          bps[bpos++].ip = t->start;
+        hit_cnt += pt_incoming_bbs_hits(t, NULL);
+        // - pt_hit_count(dec_get_bb(dec, t->out[0]));
+      }
+      break;
+    case BB_CALL:
+      if (t->out[0] == bb->start) {
+        printf("%s (%ld) %.16lx -> %.16lx\n", BB_TYPES[t->type],
+               pt_hit_count(t), t->start, bb->start);
+        if (bps)
+          bps[bpos++].ip = t->start;
+        hit_cnt += pt_hit_count(t);
+      }
+      break;
+    default:
+      printf("Unimplemented type '%s' %.16lx!\n", BB_TYPES[t->type], t->start);
+      break;
+    }
+  }
+  return hit_cnt;
 }

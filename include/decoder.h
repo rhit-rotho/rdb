@@ -66,6 +66,9 @@ typedef struct PTDecoder {
   uint64_t *counters;
   size_t counters_sz;
 
+  BasicBlock **bbs;
+  size_t bb_cnt;
+
   // uint64_t callstack[CALLSTACK_SZ];
   // size_t cpos;
 
@@ -89,7 +92,6 @@ BasicBlock *dec_get_bb(PTDecoder *dec, uint64_t sip);
 uint8_t *dec_parse_psb(PTDecoder *dec, uint8_t *trace);
 
 uint8_t *dec_sync_next(PTDecoder *dec, uint8_t *trace, size_t n);
-void dec_hit_counters(PTDecoder *dec);
 
 void dec_clear_hit_counters(PTDecoder *dec);
 uint64_t dec_hit_count(PTDecoder *dec, BasicBlock *bb);

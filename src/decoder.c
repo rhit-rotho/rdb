@@ -47,7 +47,7 @@ uint8_t PT_PAD = 0x00;
 uint8_t PT_MODE[] = {0x99};
 size_t PT_MODE_SZ = 2;
 
-char *BB_TYPES[] = {"INVALID", "JMP", "B", "ICALL", "CALL", "RET"};
+const char *BB_TYPES[] = {"INVALID", "JMP", "B", "ICALL", "CALL", "RET"};
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -95,7 +95,7 @@ void trace_push_t(TransitionTrace *trace, uint8_t tnt) {
   trace->tmpsz += 1;
 }
 
-void trace_push(TransitionTrace *tt, BasicBlock *bb, uint8_t tnt) {
+void trace_push(TransitionTrace *tt, BasicBlock *bb) {
   assert(bb != NULL);
 
   if (tt->sz == tt->cap) {
@@ -107,15 +107,12 @@ void trace_push(TransitionTrace *tt, BasicBlock *bb, uint8_t tnt) {
   tt->sz++;
 }
 
-BasicBlock **bbs;
-size_t bb_cnt;
-
 void *bb_alloc(PTDecoder *dec) {
-  assert(bb_cnt < 0x1000);
-  assert(bb_cnt < dec->counters_sz);
+  assert(dec->bb_cnt < 0x1000);
+  assert(dec->bb_cnt < dec->counters_sz);
   BasicBlock *bb = calloc(1, sizeof(BasicBlock));
-  bb->id = bb_cnt;
-  bbs[bb_cnt++] = bb;
+  bb->id = dec->bb_cnt;
+  dec->bbs[dec->bb_cnt++] = bb;
   return bb;
 }
 
@@ -374,12 +371,12 @@ __attribute__((hot)) void dec_flush_tnt(PTDecoder *dec, TransitionTrace *tt) {
 
     for (size_t i = 0; i < tt->tmpsz; ++i, tt->tmp <<= 1) {
       if ((tt->tmp & (1ull << (8 * sizeof(tt->tmp) - 1))) == 0) {
-        trace_push(tt, dec->current_bb, 0);
+        trace_push(tt, dec->current_bb);
         BasicBlock *tbb = dec_transition_to_next_conditional(dec);
         dec->current_bb = dec_get_bb(dec, tbb->out[1]);
         dec->counters[dec->current_bb->id]++;
       } else {
-        trace_push(tt, dec->current_bb, 1);
+        trace_push(tt, dec->current_bb);
         BasicBlock *tbb = dec_transition_to_next_conditional(dec);
         dec->current_bb = dec_get_bb(dec, tbb->out[0]);
         dec->counters[dec->current_bb->id]++;
@@ -986,13 +983,8 @@ uint64_t dec_hit_count(PTDecoder *dec, BasicBlock *bb) {
   return dec->counters[bb->id];
 }
 
-void dec_set_count(PTDecoder*dec, BasicBlock*bb, uint64_t cnt) {
-  return dec->counters[bb->id]=cnt;
-}
-
-void dec_hit_counters(PTDecoder *dec) {
-  for (size_t i = 0; i < bb_cnt; ++i)
-    printf("0x%.16lx: %ld\n", bbs[i]->start, dec->counters[bbs[i]->id]);
+void dec_set_count(PTDecoder *dec, BasicBlock *bb, uint64_t cnt) {
+  dec->counters[bb->id] = cnt;
 }
 
 int dec_init(PTDecoder *dec) {
@@ -1018,8 +1010,8 @@ int dec_init(PTDecoder *dec) {
   dec->bpos_cap = 0x1000;
   dec->bind_targets = malloc(dec->bpos_cap * sizeof(dec->bind_targets[0]));
 
-  bb_cnt = 0;
-  bbs = malloc(sizeof(BasicBlock *) * 0x1000);
+  dec->bb_cnt = 0;
+  dec->bbs = malloc(sizeof(BasicBlock *) * 0x1000);
 
   if (dec->counters == NULL) {
     dec->counters_sz = 0x1000;

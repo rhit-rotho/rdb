@@ -101,6 +101,9 @@ void gdb_save_state(gdbctx *ctx) {
   // Counters are saved automatically as part of the previous commit :)
   pt_update_counters(ctx);
   pt_finalize(ctx);
+
+  pt_get_counts(ctx->bb_count, ctx->insn_count);
+
   pbvt_commit();
 
   pt_clear_counters();
@@ -351,7 +354,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
       size_t tot = inc;
       int status;
       size_t previ = 0;
-      for (size_t i = 0; i < hit_cnt - 1; ++i) {
+      size_t i = 0;
+      for (i = 0; i < hit_cnt - 1; ++i) {
         xioctl(ctx->pfd, PERF_EVENT_IOC_ENABLE, 0);
         xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
         waitpid(ctx->ppid, &status, 0);
@@ -400,9 +404,8 @@ void gdb_handle_b_commands(gdbctx *ctx, char *buf, size_t n) {
 
       pt_update_counters(ctx);
       pt_finalize(ctx);
-      GDB_PRINTF("Hit cnt was %.16ld, now %.16ld\n", pt_hit_count(bb),
-                 pt_hit_count(bb) - 1);
-      // pt_set_count(bb, pt_hit_count(bb));
+      GDB_PRINTF("Hit cnt was %.16ld, now %.16ld\n", pt_hit_count(bb), i - 1);
+      pt_set_count(bb, i - previ);
       gdb_save_state(ctx);
     }
 

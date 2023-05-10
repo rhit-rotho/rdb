@@ -87,9 +87,31 @@ int gdbstub(void *args) {
 
   // signal(SIGSEGV, sighandler);
 
-  // GDB_PRINTF("Press [enter] to continue...\n", 0);
-  // char t;
-  // read(0, &t, 1);
+  GDB_PRINTF("Press [enter] to continue...\n", 0);
+  char t;
+  read(0, &t, 1);
+
+  setlocale(LC_NUMERIC, "");
+
+  // Initialize gdbctx
+  gdbctx gctx = {0};
+  gdbctx *ctx = &gctx;
+
+  ctx->ppid = ppid;
+  ctx->stopped = 1;
+  ctx->insn_count = pbvt_calloc(1, sizeof(uint64_t));
+  ctx->bb_count = pbvt_calloc(1, sizeof(uint64_t));
+  ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
+  ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
+
+  xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
+  waitpid(ctx->ppid, &status, 0);
+  GDB_PRINTF("status: %d\n", status);
+  ctx->regs->rax = 0;
+  ctx->fpregs->cwd = 0;
+  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
+  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
+  GDB_PRINTF("rip: %p\n", ctx->regs->rip);
 
   char path[PATH_MAX];
   snprintf(path, PATH_MAX, "/proc/%d/maps", ppid);
@@ -143,6 +165,13 @@ int gdbstub(void *args) {
       continue;
     }
 
+    // Hack for demo
+    if (from == 0x13371337000ul) {
+      GDB_PRINTF("[demo] %s 0x%.16lx - 0x%.16lx\n", flags, from, to);
+      pbvt_track_range((void *)from, to - from, prot);
+      continue;
+    }
+
     // TODO: This is broken currently. pbvt supports it but we do not, we need a
     // way to check whether our target is segfaulting because we are controlling
     // a region, or if it is a legitimate crash.
@@ -157,28 +186,6 @@ int gdbstub(void *args) {
   close(maps);
 
   GDB_PRINTF("Done tracking memory...\n", 0);
-
-  setlocale(LC_NUMERIC, "");
-
-  // Initialize gdbctx
-  gdbctx gctx = {0};
-  gdbctx *ctx = &gctx;
-
-  ctx->ppid = ppid;
-  ctx->stopped = 1;
-  ctx->insn_count = pbvt_calloc(1, sizeof(uint64_t));
-  ctx->bb_count = pbvt_calloc(1, sizeof(uint64_t));
-  ctx->regs = pbvt_calloc(1, sizeof(struct user_regs_struct));
-  ctx->fpregs = pbvt_calloc(1, sizeof(struct user_fpregs_struct));
-
-  xptrace(PTRACE_CONT, ctx->ppid, NULL, NULL);
-  waitpid(ctx->ppid, &status, 0);
-  GDB_PRINTF("status: %d\n", status);
-  ctx->regs->rax = 0;
-  ctx->fpregs->cwd = 0;
-  xptrace(PTRACE_GETREGS, ctx->ppid, NULL, ctx->regs);
-  xptrace(PTRACE_GETFPREGS, ctx->ppid, NULL, ctx->fpregs);
-  GDB_PRINTF("rip: %p\n", ctx->regs->rip);
 
   pt_init(ctx);
   gdb_save_state(ctx);
@@ -338,7 +345,7 @@ int gdbstub(void *args) {
         continue;
 
       gdb_pause(ctx);
-      if (ctx->snapshot_counter + 1 == 20) {
+      if (ctx->snapshot_counter + 1 == 10) {
         GDB_PRINTF("Snapshot because of timeout elapsed %lf\n",
                    get_time() - ctx->prev_snapshot);
         ctx->prev_snapshot = get_time();
